@@ -7430,7 +7430,7 @@ app.post('/api/candidates/select', authenticateJWT, async (req, res) => {
 // Generate Offer Draft (auto-filled HTML from template)
 app.post('/api/offers/draft', authenticateJWT, async (req, res) => {
   try {
-    const { candidateId, assessmentSessionId, template } = req.body;
+    const { candidateId, assessmentSessionId, template, offerData } = req.body;
     const assessment = await AssessmentSession.findById(assessmentSessionId || candidateId)
       .populate('resumeId');
     if (!assessment) {
@@ -7438,9 +7438,9 @@ app.post('/api/offers/draft', authenticateJWT, async (req, res) => {
     }
 
     const user = await User.findById(req.user.id);
-    const candidateName = assessment.resumeId?.name || assessment.candidateEmail || 'Candidate';
-    const jobTitle = assessment.jobTitle || 'Position';
-    const companyName = user?.companyName || 'Your Company';
+    const candidateName = offerData?.candidateName || assessment.resumeId?.name || assessment.candidateEmail || 'Candidate';
+    const jobTitle = offerData?.position || assessment.jobTitle || 'Position';
+    const companyName = offerData?.companyName || user?.companyName || 'Your Company';
     const today = new Date().toLocaleDateString();
 
     const tpl = (template || 'branded').toLowerCase();
