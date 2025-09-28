@@ -7338,9 +7338,13 @@ app.post('/api/candidates/select', authenticateJWT, async (req, res) => {
     const fileName = `offer_letter_${(candidate.name || candidate.email).replace(/\s+/g, '_')}_${Date.now()}.pdf`;
     const s3Key = `offer-letters/${fileName}`;
     await uploadToS3(pdfBuffer, s3Key, 'application/pdf');
-    
+    const command = new GetObjectCommand({
+      Bucket: process.env.MINIO_BUCKET_NAME,
+      Key: s3Key
+    });
+    const offerLetterUrl = await getSignedUrl(s3, command, { expiresIn: 604800 });
     // Send offer letter email to candidate
-    const candidateEmail = candidate.email || assessment.candidateEmail;
+    const candidateEmail = candidate.email || assessment.candidateEmail || offerData?.candidateEmail;
     if (!candidateEmail) {
       console.warn('No candidate email available to send offer letter');
       return res.status(400).json({ success: false, error: 'Candidate email is missing. Please add email and try again.' });
@@ -7354,8 +7358,8 @@ app.post('/api/candidates/select', authenticateJWT, async (req, res) => {
         position: offerData.position || assessment.jobTitle,
         salary: offerData.salary,
         startDate: offerData.startDate,
-        companyName: user.companyName
-      }, s3Key);
+        companyName: offerData?.companyName || user.companyName
+      }, offerLetterUrl); 
     } catch (e) {
       console.warn('Failed to send Candidate offer letter:', e?.message);
     }
@@ -7364,14 +7368,14 @@ app.post('/api/candidates/select', authenticateJWT, async (req, res) => {
       const { sendOfferLetterToHR } = require('./services/interviewService');
       await sendOfferLetterToHR({
         hrEmail: user.email,
-        companyName: user.companyName,
+        companyName: offerData?.companyName || user.companyName,
         candidateName: candidate.name,
         position: offerData.position || assessment.jobTitle,
         salary: offerData.salary,
         startDate: offerData.startDate,
         assessmentScore: assessment.testResult?.combinedScore || 'N/A',
         interviewRating: interviewFeedback?.rating || 'N/A'
-      }, s3Key);
+      }, offerLetterUrl); 
     } catch (e) {
       console.warn('Failed to send HR copy of offer letter:', e?.message);
     }
@@ -7714,9 +7718,63 @@ app.post('/api/offers/draft', authenticateJWT, async (req, res) => {
   </body>
 </html>`;
 
-    const draftHtml = tpl === 'appointment' ? appointment : tpl === 'simple' ? simple : branded;
+// Helpers to format values and fill placeholders
+const formatDate = (dateStr) => {
+  if (!dateStr) return '';
+  try {
+    return new Date(dateStr).toLocaleDateString('en-IN', { day: 'numeric', month: 'long', year: 'numeric' });
+  } catch {
+    return String(dateStr);
+  }
+};
 
-    return res.json({ success: true, draftHtml });
+const formatSalary = (amount, currency = (offerData?.currency || 'INR')) => {
+  if (amount === undefined || amount === null || amount === '') return '';
+  const n = Number(amount);
+  const formatted = isNaN(n) ? String(amount) : n.toLocaleString('en-IN');
+  const symbol = currency === 'INR' ? '₹' : (currency === 'USD' ? '$' : currency);
+  return `${symbol}${formatted}`;
+};
+
+const buildCandidateFullBlock = () => {
+  const parts = [
+    candidateName,
+    offerData?.candidateEmail,
+    offerData?.candidateAddress
+  ].filter(Boolean);
+  return parts.join('<br/>');
+};
+
+const buildSalarySection = () => {
+  const salaryFmt = formatSalary(offerData?.salary);
+  return {
+    earningsRows: '',
+    deductionsRows: '',
+    totalEarnings: salaryFmt,
+    totalDeductions: '0',
+    netSalary: salaryFmt,
+    annualTakeHome: salaryFmt,
+    salaryInWords: ''
+  };
+};
+
+const fillTemplate = (html, map) =>
+  Object.entries(map).reduce((acc, [k, v]) => acc.replace(new RegExp(`\\{{2}${k}\\}{2}`, 'g'), v ?? ''), html);
+// Choose the raw template
+const rawHtml = tpl === 'appointment' ? appointment : tpl === 'simple' ? simple : branded;
+
+// Build replacements from offerData
+const filled = fillTemplate(rawHtml, {
+  candidateFullBlock: buildCandidateFullBlock(),
+  startDate: formatDate(offerData?.startDate),
+  interviewDate: formatDate(offerData?.interviewDate),
+  salary: formatSalary(offerData?.salary),
+  termsBlock: '',
+  salaryMatrix: '',
+  ...buildSalarySection()
+});
+
+return res.json({ success: true, draftHtml: filled });
   } catch (error) {
     console.error('Error generating offer draft:', error);
     return res.status(500).json({ success: false, error: 'Failed to generate draft' });
@@ -7741,28 +7799,112 @@ app.post('/api/offers/finalize', authenticateJWT, async (req, res) => {
 
     // naive sanitization (replace with sanitize-html in production)
     const safeHtml = String(editedHtml).replace(/<script[\s\S]*?<\/script>/gi, '');
+   // Helpers to format values and fill placeholders
+   const formatDate = (dateStr) => {
+    if (!dateStr) return '';
+    try {
+      return new Date(dateStr).toLocaleDateString('en-IN', { day: 'numeric', month: 'long', year: 'numeric' });
+    } catch {
+      return String(dateStr);
+    }
+  };
+  
+  const formatSalary = (amount, currency = (offerData?.currency || 'INR')) => {
+    if (amount === undefined || amount === null || amount === '') return '';
+    const n = Number(amount);
+    const formatted = isNaN(n) ? String(amount) : n.toLocaleString('en-IN');
+    const symbol = currency === 'INR' ? '₹' : (currency === 'USD' ? '$' : currency);
+    return `${symbol}${formatted}`;
+  };
+  
+  const buildCandidateFullBlock = () => {
+    const parts = [
+      candidateName,
+      offerData?.candidateEmail,
+      offerData?.candidateAddress
+    ].filter(Boolean);
+    return parts.join('<br/>');
+  };
+  
+  const buildSalarySection = () => {
+    const salaryFmt = formatSalary(offerData?.salary);
+    return {
+      earningsRows: '',        // optional: generate rows if you have breakdown
+      deductionsRows: '',      // optional: generate rows if you have breakdown
+      totalEarnings: salaryFmt,
+      totalDeductions: '0',
+      netSalary: salaryFmt,
+      annualTakeHome: salaryFmt,
+      salaryInWords: ''        // optional: add number-to-words later
+    };
+  };
+  
+  const fillTemplate = (html, map) =>
+    Object.entries(map).reduce((acc, [k, v]) => acc.replace(new RegExp(`\\{{2}${k}\\}{2}`, 'g'), v ?? ''), html);
+  
+   // Reuse the same helpers here (formatDate, formatSalary, buildCandidateFullBlock, buildSalarySection, fillTemplate)
 
-    const pdfBuffer = await new Promise((resolve, reject) => {
-      htmlToPdf.create(safeHtml, { format: 'A4', border: '10mm' }).toBuffer((err, buffer) => {
-        if (err) return reject(err);
-        resolve(buffer);
-      });
-    });
+   const filledHtml = fillTemplate(safeHtml, {
+    candidateFullBlock: (() => {
+      const parts = [
+        (offerData?.candidateName || candidateName),
+        offerData?.candidateEmail,
+        offerData?.candidateAddress
+      ].filter(Boolean);
+      return parts.join('<br/>');
+    })(),
+    startDate: formatDate(offerData?.startDate),
+    interviewDate: formatDate(offerData?.interviewDate),
+    salary: formatSalary(offerData?.salary),
+    termsBlock: '',
+    salaryMatrix: '',
+    ...buildSalarySection()
+  });
+
+// Use filledHtml for PDF
+const pdfBuffer = await new Promise((resolve, reject) => {
+  htmlToPdf.create(filledHtml, { format: 'A4', border: '10mm' }).toBuffer((err, buffer) => {
+    if (err) return reject(err);
+    resolve(buffer);
+  });
+});
 
     const fileName = `offer_letter_${(candidateName || 'candidate').replace(/\s+/g, '_')}_${Date.now()}.pdf`;
     const s3Key = `offer-letters/${fileName}`;
-    await uploadToS3(pdfBuffer, s3Key, 'application/pdf');
+   // After:
+await uploadToS3(pdfBuffer, s3Key, 'application/pdf');
 
-    // Email link
-    const { sendOfferLetter } = require('./services/interviewService');
-    await sendOfferLetter({
-      candidateName,
-      candidateEmail: assessment.candidateEmail,
-      position: offerData?.position || assessment.jobTitle,
-      salary: offerData?.salary,
-      startDate: offerData?.startDate,
-      companyName: user?.companyName
-    }, s3Key);
+// Add this pre-sign block (same style as sendReportToHR):
+const command = new GetObjectCommand({
+  Bucket: process.env.MINIO_BUCKET_NAME,
+  Key: s3Key
+});
+const offerLetterUrl = await getSignedUrl(s3, command, { expiresIn: 604800 }); // 7 days
+
+  // Import both senders for clarity
+const { sendOfferLetter, sendOfferLetterToHR } = require('./services/interviewService');
+
+// Send to Candidate
+await sendOfferLetter({
+  candidateName,
+  candidateEmail: assessment.candidateEmail || offerData?.candidateEmail, // fallback added
+  position: offerData?.position || assessment.jobTitle,
+  salary: offerData?.salary,
+  startDate: offerData?.startDate,
+  companyName: offerData?.companyName || user?.companyName
+}, offerLetterUrl);
+
+// Send to HR
+await sendOfferLetterToHR({
+  hrEmail: user.email,
+  companyName: offerData?.companyName || user?.companyName,
+  candidateName,
+  position: offerData?.position || assessment.jobTitle,
+  salary: offerData?.salary,
+  startDate: offerData?.startDate,
+  assessmentScore: assessment.testResult?.combinedScore || 'N/A',
+  interviewRating: 'N/A'
+}, offerLetterUrl);
 
     return res.json({ success: true, s3Key });
   } catch (error) {
