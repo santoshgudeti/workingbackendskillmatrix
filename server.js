@@ -35,7 +35,7 @@ const Chart = require('chart.js');
 const { createCanvas } = require('canvas');
 const htmlToPdf = require('html-pdf');
 const sendConsentEmail = require('./services/sendConsentMail'); // Or wherever you place it
-
+const { handleAutomaticJobPosting } = require('./services/externalJobPostingService');
 
 dotenv.config();
 // Initialize Express app
@@ -2043,6 +2043,35 @@ emitApiResponseUpdate(savedResponse);
           'usage.resumeUploads': files.resumes.length
         }
       });
+      
+      // Automatically create job post in external system (non-blocking)
+      if (files.job_description && files.job_description.length > 0) {
+        const jobDescriptionFile = files.job_description[0];
+        console.log(`🔄 Initiating automatic job posting for user: ${req.user.email}`);
+        console.log(`📋 Job description file: ${jobDescriptionFile.originalname}, Size: ${jobDescriptionFile.buffer.length} bytes`);
+        
+        // Run in background without blocking the response
+        setImmediate(async () => {
+          try {
+            console.log('🔄 Starting automatic job posting in background...');
+            const jobPostResult = await handleAutomaticJobPosting(
+              jobDescriptionFile.buffer, 
+              jobDescriptionFile.originalname, 
+              req.user.email
+            );
+            
+            if (jobPostResult.success) {
+              console.log(`✅ Automatic job post created: ${jobPostResult.publicUrl}`);
+            } else {
+              console.log(`⚠️ Automatic job post not created: ${jobPostResult.reason || jobPostResult.error}`);
+            }
+          } catch (error) {
+            console.error('❌ Error in automatic job posting background process:', error.message);
+            console.error('📋 Error stack:', error.stack);
+          }
+        });
+      }
+      
     console.log(`Total duplicates found: ${duplicateCount}`); // Log the total number of duplicates
     res.status(200).json({ message: 'Files processed and stored successfully.', results, duplicateCount });
   } catch (error) {
