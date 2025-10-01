@@ -2047,9 +2047,6 @@ emitApiResponseUpdate(savedResponse);
       // Automatically create job post in external system (non-blocking)
       if (files.job_description && files.job_description.length > 0) {
         const jobDescriptionFile = files.job_description[0];
-        console.log(`🔄 Initiating automatic job posting for user: ${req.user.email}`);
-        console.log(`📋 Job description file: ${jobDescriptionFile.originalname}, Size: ${jobDescriptionFile.buffer.length} bytes`);
-        
         // Run in background without blocking the response
         setImmediate(async () => {
           try {
@@ -2067,7 +2064,6 @@ emitApiResponseUpdate(savedResponse);
             }
           } catch (error) {
             console.error('❌ Error in automatic job posting background process:', error.message);
-            console.error('📋 Error stack:', error.stack);
           }
         });
       }
