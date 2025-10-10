@@ -28,13 +28,18 @@ const transporter = nodemailer.createTransport({
 // Local S3 upload helper (mirrors server upload behavior)
 async function uploadToS3(fileData, key, contentType, bucket = process.env.MINIO_BUCKET_NAME) {
   const s3 = new S3Client({
-    region: process.env.AWS_REGION || 'auto',
-    endpoint: process.env.MINIO_ENDPOINT || process.env.AWS_S3_ENDPOINT,
+    region: process.env.MINIO_REGION || process.env.AWS_REGION || 'auto',
+    endpoint: process.env.MINIO_SECURE === 'true' || process.env.MINIO_SECURE === 'True' 
+      ? `https://${process.env.MINIO_ENDPOINT.replace('https://', '').replace('http://', '')}` 
+      : `http://${process.env.MINIO_ENDPOINT.replace('https://', '').replace('http://', '')}`,
     forcePathStyle: true,
-    credentials: process.env.AWS_ACCESS_KEY_ID && process.env.AWS_SECRET_ACCESS_KEY ? {
+    credentials: process.env.MINIO_ACCESS_KEY && process.env.MINIO_SECRET_KEY ? {
+      accessKeyId: process.env.MINIO_ACCESS_KEY,
+      secretAccessKey: process.env.MINIO_SECRET_KEY,
+    } : (process.env.AWS_ACCESS_KEY_ID && process.env.AWS_SECRET_ACCESS_KEY ? {
       accessKeyId: process.env.AWS_ACCESS_KEY_ID,
       secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY,
-    } : undefined,
+    } : undefined),
   });
 
   const upload = new Upload({
@@ -468,6 +473,147 @@ async function getCandidateDetails(candidateId, assessmentSessionId) {
   }
 }
 
+// Send document collection email
+async function sendDocumentCollectionEmail(documentData) {
+  const { candidateName, candidateEmail, companyName = 'Your Company', documentTypes, customMessage, template = 'standard', templateId, userId, documentCollectionId } = documentData;
+  
+  // Map document types to human-readable names
+  const documentTypeMap = {
+    'aadhaar': 'Aadhaar Card',
+    'passport': 'Passport',
+    'voter-id': 'Voter ID',
+    'driving-license': 'Driving License',
+    'address-proof': 'Address Proof',
+    'educational-certificates': 'Educational Certificates',
+    'experience-certificates': 'Experience Certificates',
+    'relieving-letters': 'Relieving Letters',
+    'salary-slips': 'Salary Slips',
+    'form-16': 'Form 16',
+    'photographs': 'Passport Size Photographs',
+    'bank-details': 'Bank Details (Cancelled Cheque or Passbook)',
+    'pan-card': 'PAN Card',
+    'medical-certificates': 'Medical/Health Certificates',
+    'nda': 'NDA (Non-Disclosure Agreement)',
+    'background-verification': 'Background Verification Consent',
+    'references': 'Reference Details',
+    'other': 'Other Documents'
+  };
+  
+  // Generate document list
+  const documentList = documentTypes.map(type => {
+    return `<li style="margin-bottom: 8px;">${documentTypeMap[type] || type}</li>`;
+  }).join('');
+  
+  // If a specific template ID is provided, use that template
+  let emailTemplate = null;
+  if (templateId && userId) {
+    try {
+      const { getTemplateById } = require('./documentTemplateService');
+      emailTemplate = await getTemplateById(templateId, userId);
+    } catch (error) {
+      console.error('Error fetching user template:', error);
+    }
+  }
+  
+  // Use user template if available, otherwise use default template
+  const subject = emailTemplate ? emailTemplate.subject : `Document Collection Request - ${companyName}`;
+  
+  // Replace placeholders in the template
+  let htmlContent = emailTemplate ? emailTemplate.content : `
+    <div style="font-family: Arial, sans-serif; background:#f5f7fb; padding:24px;">
+      <div style="max-width:640px; margin:0 auto; background:#ffffff; border:1px solid #e5e7eb; box-shadow:0 10px 24px rgba(0,0,0,0.06); border-radius:10px; overflow:hidden;">
+        <div style="background:linear-gradient(90deg,#2563eb,#60a5fa); padding:18px 22px; color:#fff;">
+          <div style="font-size:18px; font-weight:700;">{{companyName}}</div>
+          <div style="opacity:0.9; font-size:12px;">Document Collection Request</div>
+        </div>
+        <div style="padding:22px; color:#111827;">
+          <p style="margin:0 0 16px 0;">Dear <strong>{{candidateName}}</strong>,</p>
+          <p style="margin:0 0 16px 0;">Congratulations on your selection! We are pleased to inform you that you have been selected for the position.</p>
+          
+          <div style="background:#fffbeb; border:1px solid #fbbf24; border-radius:8px; padding:16px; margin:16px 0;">
+            <div style="font-weight:700; color:#92400e; margin-bottom:8px; display:flex; align-items:center;">
+              <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="margin-right:8px;">
+                <circle cx="12" cy="12" r="10"></circle>
+                <line x1="12" y1="8" x2="12" y2="12"></line>
+                <line x1="12" y1="16" x2="12.01" y2="16"></line>
+              </svg>
+              Important Next Step
+            </div>
+            <p style="margin:0 0 12px 0;">As part of our onboarding process, we request you to submit the following documents:</p>
+            <ul style="margin:0; padding-left:20px;">
+              {{documentList}}
+            </ul>
+          </div>
+          
+          {{#if customMessage}}
+            <div style="background:#f0f9ff; border:1px solid #7dd3fc; border-radius:8px; padding:16px; margin:16px 0;">
+              <div style="font-weight:700; color:#0369a1; margin-bottom:8px;">Message from HR:</div>
+              <p style="margin:0;">{{customMessage}}</p>
+            </div>
+          {{/if}}
+          
+          <div style="background:#f0fdf4; border:1px solid #86efac; border-radius:8px; padding:16px; margin:16px 0;">
+            <div style="font-weight:700; color:#166534; margin-bottom:8px; display:flex; align-items:center;">
+              <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="margin-right:8px;">
+                <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"></path>
+                <polyline points="14 2 14 8 20 8"></polyline>
+                <line x1="16" y1="13" x2="8" y2="13"></line>
+                <line x1="16" y1="17" x2="8" y2="17"></line>
+                <polyline points="10 9 9 9 8 9"></polyline>
+              </svg>
+              Submission Instructions
+            </div>
+            <p style="margin:0 0 12px 0;">Please upload these documents using the link below:</p>
+            <div style="text-align:center; margin: 16px 0;">
+              <a href="{{uploadLink}}" 
+                 style="background:#10b981; color:#fff; padding:12px 24px; border-radius:8px; text-decoration:none; font-weight:700; display:inline-block;">
+                Upload Documents
+              </a>
+            </div>
+            <p style="margin:0; font-size:13px; color:#374151;">
+              If you have any questions, please contact our HR team at {{hrEmail}}
+            </p>
+          </div>
+          
+          <p style="margin:16px 0 0 0;">We look forward to welcoming you to our team!</p>
+          <p style="margin:16px 0 0 0;">Best regards,<br/><strong>HR Team</strong><br/>{{companyName}}</p>
+        </div>
+      </div>
+    </div>
+  `;
+  
+  // Create upload link with document collection ID
+  const uploadLink = documentCollectionId 
+    ? `${process.env.FRONTEND_URL || 'http://localhost:5173'}/document-upload/${documentCollectionId}`
+    : `${process.env.FRONTEND_URL || 'http://localhost:5173'}/document-upload`;
+  
+  // Replace placeholders in the HTML content
+  htmlContent = htmlContent
+    .replace(/{{candidateName}}/g, candidateName)
+    .replace(/{{companyName}}/g, companyName)
+    .replace(/{{documentList}}/g, documentList)
+    .replace(/{{customMessage}}/g, customMessage || '')
+    .replace(/{{uploadLink}}/g, uploadLink)
+    .replace(/{{hrEmail}}/g, process.env.SMTP_USER);
+  
+  const mailOptions = {
+    from: `"${companyName} | SkillMatrix ATS" <${process.env.SMTP_USER}>`,
+    to: candidateEmail,
+    subject: subject,
+    html: htmlContent
+  };
+
+  try {
+    console.log(`[MAIL] Sending document collection email to ${candidateEmail}`);
+    const result = await transporter.sendMail(mailOptions);
+    console.log('[MAIL] Document collection email sent:', result?.messageId || 'OK');
+    return result;
+  } catch (err) {
+    console.error('[MAIL] Document collection email send failed:', err?.message || err);
+    throw err;
+  }
+}
+
 module.exports = {
   scheduleInterview,
   sendInterviewInvite,
@@ -475,5 +621,7 @@ module.exports = {
   sendOfferLetter,
   sendOfferLetterToHR,
   sendRejectionEmail,
-  getCandidateDetails
+  getCandidateDetails,
+  sendDocumentCollectionEmail,
+  uploadToS3
 };

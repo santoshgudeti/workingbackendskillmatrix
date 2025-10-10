@@ -28,6 +28,7 @@ const { exec } = require("child_process");
 const { Upload } = require("@aws-sdk/lib-storage");
 const { Readable } = require('stream');
 const { Blob } = require('buffer');
+const JSZip = require('jszip');
 
 // Add new dependencies at the top
 const PDFDocument = require('pdfkit');
@@ -36,6 +37,7 @@ const { createCanvas } = require('canvas');
 const htmlToPdf = require('html-pdf');
 const sendConsentEmail = require('./services/sendConsentMail'); // Or wherever you place it
 const { handleAutomaticJobPosting } = require('./services/externalJobPostingService');
+const { MergedDocument, generateMergedPDF, getMergedDocuments } = require('./services/mergedPDFService');
 
 dotenv.config();
 // Initialize Express app
@@ -384,8 +386,8 @@ const InterviewSchema = new mongoose.Schema({
   meetingLink: { type: String },
   status: {
     type: String,
-    enum: ['scheduled', 'completed', 'cancelled'],
-    default: 'scheduled'
+    enum: ['not-scheduled', 'scheduled', 'completed', 'cancelled'],
+    default: 'not-scheduled'
   },
   feedback: { type: String },
   feedbackSummary: { type: String },
@@ -460,49 +462,16 @@ const CandidateDecisionSchema = new mongoose.Schema({
 
 const CandidateDecision = mongoose.model('CandidateDecision', CandidateDecisionSchema);
 
-// ==============================
-// ✅ NEW SCHEMAS
-// ==============================
-const jobPosterSchema = new mongoose.Schema({
-  name: String,
-  email: { type: String, required: true, unique: true },
-  password: { type: String, required: true },
-  isVerified: { type: Boolean, default: false },
-}, { timestamps: true });
-const jobPostSchema = new mongoose.Schema({
-  title: String,
-  companyName: String, // NEW FIELD ADDED
-  location: String,
-  experience: String,
-  jobType: String,
-  department: String,
-  skillsRequired: [String],
-  salaryRange: String,
-  jobDescriptionFile: String,
-  descriptionText: String,
-  publicId: { type: String, unique: true },
-  applications: [{ type: mongoose.Schema.Types.ObjectId, ref: 'Application' }],
-  createdAt: { type: Date, default: Date.now },
-  postedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'JobPoster' },
-});
-
-const JobPoster = mongoose.model('JobPoster', jobPosterSchema);
-const JobPost = mongoose.model('JobPost', jobPostSchema);
-const applicationSchema = new mongoose.Schema({
-  jobId: { type: mongoose.Schema.Types.ObjectId, ref: 'JobPost', required: true },
-  candidateName: { type: String, required: true },
-  candidateEmail: { type: String, required: true },
-  candidatePhone: String,
-  resumeFile: String, // S3 key
-  appliedAt: { type: Date, default: Date.now }
-});
-
-const Application = mongoose.model('Application', applicationSchema);
 
 
+
+// Document Collection Model
+const DocumentCollection = require('./models/DocumentCollection');
 
 // ==============================
-// ✅ JOB PORTAL AUTH ROUTES
+
+// Document Collection Routes
+
 // ==============================
 
 
@@ -579,7 +548,7 @@ function authenticateJobPoster(req, res, next) {
 
 const verifyOwnership = (model) => async (req, res, next) => {
   try {
- const id = req.params.resumeId || req.params.jobDescriptionId || req.params.id;
+ const id = req.params.resumeId || req.params.jobDescriptionId || req.params.sessionId || req.params.id;
 
     console.log(`Verifying ownership for ${model.modelName} ${id}`);
 
@@ -959,6 +928,537 @@ app.get('/api/resumes/:resumeId', authenticateJWT, verifyOwnership(Resume), asyn
     });
   }
 });
+
+// 🔥 NEW: Bulk Resume Download Endpoint
+app.post('/api/resumes/bulk-download', authenticateJWT, async (req, res) => {
+  try {
+    const { resumeIds, candidates } = req.body;
+    
+    console.log('🔥 [BULK DOWNLOAD API] Starting bulk resume download:', {
+      userId: req.user.id,
+      resumeCount: resumeIds?.length || 0,
+      candidateCount: candidates?.length || 0,
+      timestamp: new Date().toISOString()
+    });
+
+    // Validate input
+    if (!resumeIds || !Array.isArray(resumeIds) || resumeIds.length === 0) {
+      return res.status(400).json({
+        success: false,
+        error: 'Invalid or empty resume IDs provided'
+      });
+    }
+
+    if (resumeIds.length > 50) {
+      return res.status(400).json({
+        success: false,
+        error: 'Maximum 50 resumes can be downloaded at once'
+      });
+    }
+
+    // Fetch resumes with ownership verification
+    const resumes = await Resume.find({
+      _id: { $in: resumeIds },
+      user: req.user.id // Ensure user owns these resumes
+    });
+
+    console.log('📊 [BULK DOWNLOAD API] Found resumes:', {
+      requested: resumeIds.length,
+      found: resumes.length,
+      missing: resumeIds.length - resumes.length
+    });
+
+    if (resumes.length === 0) {
+      return res.status(404).json({
+        success: false,
+        error: 'No accessible resumes found'
+      });
+    }
+
+    // Create ZIP file
+    const zip = new JSZip();
+    let successCount = 0;
+    let failureCount = 0;
+    const downloadResults = [];
+
+    // Process each resume
+    for (let i = 0; i < resumes.length; i++) {
+      const resume = resumes[i];
+      try {
+        console.log(`📄 [BULK DOWNLOAD API] Processing resume ${i + 1}/${resumes.length}:`, {
+          resumeId: resume._id,
+          filename: resume.filename,
+          s3Key: resume.s3Key
+        });
+
+        // Get file from S3
+        const command = new GetObjectCommand({
+          Bucket: process.env.MINIO_BUCKET_NAME,
+          Key: resume.s3Key
+        });
+        
+        const response = await s3.send(command);
+        const buffer = await streamToBuffer(response.Body);
+        
+        // Find candidate info for better filename
+        const candidateInfo = candidates?.find(c => 
+          c.resumeId === resume._id.toString() || 
+          c.resumeId === resume._id
+        );
+        
+        // Create safe filename
+        const safeName = candidateInfo?.name ? 
+          candidateInfo.name.replace(/[^a-zA-Z0-9]/g, '_') : 
+          `Candidate_${i + 1}`;
+        
+        const fileExt = resume.filename ? 
+          resume.filename.split('.').pop() || 'pdf' : 'pdf';
+        
+        const zipFilename = candidateInfo?.matchingPercentage ? 
+          `${safeName}_${candidateInfo.matchingPercentage}%.${fileExt}` :
+          `${safeName}.${fileExt}`;
+        
+        // Add to ZIP
+        zip.file(zipFilename, buffer);
+        
+        successCount++;
+        downloadResults.push({
+          resumeId: resume._id,
+          filename: resume.filename,
+          zipFilename,
+          success: true,
+          candidateName: candidateInfo?.name || 'Unknown',
+          matchingPercentage: candidateInfo?.matchingPercentage || 0
+        });
+        
+        console.log(`✅ [BULK DOWNLOAD API] Resume added to ZIP: ${zipFilename}`);
+        
+      } catch (error) {
+        console.error(`❌ [BULK DOWNLOAD API] Failed to process resume ${resume._id}:`, error);
+        failureCount++;
+        downloadResults.push({
+          resumeId: resume._id,
+          filename: resume.filename,
+          success: false,
+          error: error.message,
+          candidateName: candidates?.find(c => c.resumeId === resume._id.toString())?.name || 'Unknown'
+        });
+      }
+    }
+
+    if (successCount === 0) {
+      return res.status(500).json({
+        success: false,
+        error: 'Failed to process any resumes',
+        details: downloadResults
+      });
+    }
+
+    // Generate ZIP buffer
+    console.log('📦 [BULK DOWNLOAD API] Generating ZIP file...');
+    const zipBuffer = await zip.generateAsync({ 
+      type: 'nodebuffer',
+      compression: 'DEFLATE',
+      compressionOptions: { level: 6 }
+    });
+    
+    console.log('✅ [BULK DOWNLOAD API] ZIP file generated:', {
+      sizeBytes: zipBuffer.length,
+      sizeMB: (zipBuffer.length / 1024 / 1024).toFixed(2)
+    });
+
+    // Upload ZIP to S3 for download
+    const zipKey = `bulk-downloads/${req.user.id}/${Date.now()}_resumes.zip`;
+    const zipUploadCommand = new PutObjectCommand({
+      Bucket: process.env.MINIO_BUCKET_NAME,
+      Key: zipKey,
+      Body: zipBuffer,
+      ContentType: 'application/zip',
+      ContentDisposition: `attachment; filename="bulk_resumes_${new Date().toISOString().split('T')[0]}.zip"`
+    });
+    
+    await s3.send(zipUploadCommand);
+    
+    // Generate signed download URL
+    const downloadCommand = new GetObjectCommand({
+      Bucket: process.env.MINIO_BUCKET_NAME,
+      Key: zipKey,
+      ResponseContentDisposition: `attachment; filename="bulk_resumes_${new Date().toISOString().split('T')[0]}.zip"`
+    });
+    
+    const downloadUrl = await getSignedUrl(s3, downloadCommand, { expiresIn: 3600 }); // 1 hour
+    
+    console.log('🎉 [BULK DOWNLOAD API] Bulk download completed successfully:', {
+      successCount,
+      failureCount,
+      totalRequested: resumeIds.length,
+      zipSizeMB: (zipBuffer.length / 1024 / 1024).toFixed(2),
+      downloadUrl: downloadUrl.substring(0, 100) + '...'
+    });
+
+    res.json({
+      success: true,
+      downloadUrl,
+      summary: {
+        total: resumeIds.length,
+        successful: successCount,
+        failed: failureCount,
+        zipSizeMB: (zipBuffer.length / 1024 / 1024).toFixed(2)
+      },
+      results: downloadResults
+    });
+
+  } catch (error) {
+    console.error('❌ [BULK DOWNLOAD API] Bulk download failed:', error);
+    
+    let errorMessage = 'Failed to create bulk download';
+    if (error.message.includes('timeout')) {
+      errorMessage = 'Download timeout - too many files or network issues';
+    } else if (error.message.includes('NoSuchKey')) {
+      errorMessage = 'Some resume files are missing from storage';
+    } else if (error.message.includes('AccessDenied')) {
+      errorMessage = 'Access denied to some resume files';
+    }
+    
+    res.status(500).json({
+      success: false,
+      error: errorMessage,
+      details: process.env.NODE_ENV === 'development' ? error.message : undefined
+    });
+  }
+});
+
+// ===========================
+// MERGED PDF ENDPOINTS
+// ===========================
+
+// Generate merged PDF (resume + report) for a specific assessment session
+app.post('/api/merged-pdf/generate/:sessionId', authenticateJWT, verifyOwnership(AssessmentSession), async (req, res) => {
+  try {
+    const { sessionId } = req.params;
+    
+    console.log(`🔄 [MERGED PDF API] Generating merged PDF for session: ${sessionId}`);
+    
+    // Generate merged PDF using the service
+    const result = await generateMergedPDF(sessionId, req.user.id);
+    
+    if (result.success) {
+      // Generate signed URL for download
+      const command = new GetObjectCommand({
+        Bucket: process.env.MINIO_BUCKET_NAME,
+        Key: result.s3Key
+      });
+      
+      const downloadUrl = await getSignedUrl(s3, command, { expiresIn: 3600 }); // 1 hour
+      
+      console.log(`✅ [MERGED PDF API] Generated merged PDF: ${result.mergedDocumentId}`);
+      
+      res.json({
+        success: true,
+        message: result.existed ? 'Merged PDF already exists' : 'Merged PDF generated successfully',
+        data: {
+          ...result,
+          downloadUrl
+        }
+      });
+    } else {
+      throw new Error('Failed to generate merged PDF');
+    }
+    
+  } catch (error) {
+    console.error(`❌ [MERGED PDF API] Error generating merged PDF for session ${req.params.sessionId}:`, error);
+    
+    let errorMessage = 'Failed to generate merged PDF';
+    if (error.message.includes('Assessment session not found')) {
+      errorMessage = 'Assessment session not found';
+    } else if (error.message.includes('Resume not found')) {
+      errorMessage = 'Resume not available for this session';
+    } else if (error.message.includes('Assessment report not found')) {
+      errorMessage = 'Assessment report not available for this session';
+    }
+    
+    res.status(500).json({
+      success: false,
+      error: errorMessage,
+      details: process.env.NODE_ENV === 'development' ? error.message : undefined
+    });
+  }
+});
+
+// Get merged documents for a user
+app.get('/api/merged-pdf/list', authenticateJWT, async (req, res) => {
+  try {
+    const { page = 1, limit = 20, status = 'completed' } = req.query;
+    
+    console.log(`📋 [MERGED PDF API] Fetching merged documents for user: ${req.user.id}`);
+    
+    const result = await getMergedDocuments(req.user.id, {
+      page: parseInt(page),
+      limit: parseInt(limit),
+      status
+    });
+    
+    res.json({
+      success: true,
+      data: result.documents,
+      pagination: result.pagination
+    });
+    
+  } catch (error) {
+    console.error(`❌ [MERGED PDF API] Error fetching merged documents:`, error);
+    res.status(500).json({
+      success: false,
+      error: 'Failed to fetch merged documents',
+      details: process.env.NODE_ENV === 'development' ? error.message : undefined
+    });
+  }
+});
+
+// Download individual merged PDF
+app.get('/api/merged-pdf/:mergedDocId', authenticateJWT, async (req, res) => {
+  try {
+    const { mergedDocId } = req.params;
+    
+    console.log(`📥 [MERGED PDF API] Downloading merged PDF: ${mergedDocId}`);
+    
+    // Find merged document with ownership verification
+    const mergedDoc = await MergedDocument.findOne({
+      _id: mergedDocId,
+      user: req.user.id
+    });
+    
+    if (!mergedDoc) {
+      return res.status(404).json({
+        success: false,
+        error: 'Merged document not found or access denied'
+      });
+    }
+    
+    if (mergedDoc.status !== 'completed') {
+      return res.status(400).json({
+        success: false,
+        error: `Merged document is not ready (status: ${mergedDoc.status})`
+      });
+    }
+    
+    // Generate signed URL for download
+    const command = new GetObjectCommand({
+      Bucket: process.env.MINIO_BUCKET_NAME,
+      Key: mergedDoc.s3Key,
+      ResponseContentDisposition: req.query.download 
+        ? `attachment; filename="${encodeURIComponent(mergedDoc.filename)}"` 
+        : 'inline'
+    });
+    
+    const url = await getSignedUrl(s3, command, { expiresIn: 3600 }); // 1 hour
+    
+    res.json({
+      success: true,
+      url,
+      filename: mergedDoc.filename,
+      candidateEmail: mergedDoc.candidateEmail,
+      jobTitle: mergedDoc.jobTitle,
+      generatedAt: mergedDoc.generatedAt
+    });
+    
+  } catch (error) {
+    console.error(`❌ [MERGED PDF API] Error downloading merged PDF:`, error);
+    res.status(500).json({
+      success: false,
+      error: 'Failed to download merged PDF',
+      details: process.env.NODE_ENV === 'development' ? error.message : undefined
+    });
+  }
+});
+
+// Bulk download merged PDFs
+app.post('/api/merged-pdf/bulk-download', authenticateJWT, async (req, res) => {
+  try {
+    const { mergedDocumentIds, candidates } = req.body;
+    
+    console.log('🔥 [MERGED PDF BULK] Starting bulk merged PDF download:', {
+      userId: req.user.id,
+      documentCount: mergedDocumentIds?.length || 0,
+      candidateCount: candidates?.length || 0,
+      timestamp: new Date().toISOString()
+    });
+
+    // Validate input
+    if (!mergedDocumentIds || !Array.isArray(mergedDocumentIds) || mergedDocumentIds.length === 0) {
+      return res.status(400).json({
+        success: false,
+        error: 'Invalid or empty merged document IDs provided'
+      });
+    }
+
+    if (mergedDocumentIds.length > 25) {
+      return res.status(400).json({
+        success: false,
+        error: 'Maximum 25 merged documents can be downloaded at once'
+      });
+    }
+
+    // Fetch merged documents with ownership verification
+    const mergedDocs = await MergedDocument.find({
+      _id: { $in: mergedDocumentIds },
+      user: req.user.id,
+      status: 'completed'
+    }).populate('assessmentSession', 'candidateEmail jobTitle completedAt');
+
+    console.log('📊 [MERGED PDF BULK] Found merged documents:', {
+      requested: mergedDocumentIds.length,
+      found: mergedDocs.length,
+      missing: mergedDocumentIds.length - mergedDocs.length
+    });
+
+    if (mergedDocs.length === 0) {
+      return res.status(404).json({
+        success: false,
+        error: 'No accessible merged documents found'
+      });
+    }
+
+    // Create ZIP file
+    const zip = new JSZip();
+    let successCount = 0;
+    let failureCount = 0;
+    const downloadResults = [];
+
+    // Process each merged document
+    for (let i = 0; i < mergedDocs.length; i++) {
+      const mergedDoc = mergedDocs[i];
+      try {
+        console.log(`📄 [MERGED PDF BULK] Processing document ${i + 1}/${mergedDocs.length}:`, {
+          documentId: mergedDoc._id,
+          filename: mergedDoc.filename,
+          s3Key: mergedDoc.s3Key
+        });
+
+        // Get file from S3
+        const command = new GetObjectCommand({
+          Bucket: process.env.MINIO_BUCKET_NAME,
+          Key: mergedDoc.s3Key
+        });
+        
+        const response = await s3.send(command);
+        const buffer = await streamToBuffer(response.Body);
+        
+        // Create safe filename for ZIP
+        const safeName = mergedDoc.candidateEmail ? 
+          mergedDoc.candidateEmail.replace(/[^a-zA-Z0-9@.]/g, '_') : 
+          `Candidate_${i + 1}`;
+        
+        const zipFilename = `${safeName}_merged_${mergedDoc.generatedAt.toISOString().split('T')[0]}.pdf`;
+        
+        // Add to ZIP
+        zip.file(zipFilename, buffer);
+        
+        successCount++;
+        downloadResults.push({
+          documentId: mergedDoc._id,
+          filename: mergedDoc.filename,
+          zipFilename,
+          success: true,
+          candidateEmail: mergedDoc.candidateEmail,
+          jobTitle: mergedDoc.jobTitle
+        });
+        
+        console.log(`✅ [MERGED PDF BULK] Document added to ZIP: ${zipFilename}`);
+        
+      } catch (error) {
+        console.error(`❌ [MERGED PDF BULK] Failed to process document ${mergedDoc._id}:`, error);
+        failureCount++;
+        downloadResults.push({
+          documentId: mergedDoc._id,
+          filename: mergedDoc.filename,
+          success: false,
+          error: error.message,
+          candidateEmail: mergedDoc.candidateEmail
+        });
+      }
+    }
+
+    if (successCount === 0) {
+      return res.status(500).json({
+        success: false,
+        error: 'Failed to process any merged documents',
+        details: downloadResults
+      });
+    }
+
+    // Generate ZIP buffer
+    console.log('📦 [MERGED PDF BULK] Generating ZIP file...');
+    const zipBuffer = await zip.generateAsync({ 
+      type: 'nodebuffer',
+      compression: 'DEFLATE',
+      compressionOptions: { level: 6 }
+    });
+    
+    console.log('✅ [MERGED PDF BULK] ZIP file generated:', {
+      sizeBytes: zipBuffer.length,
+      sizeMB: (zipBuffer.length / 1024 / 1024).toFixed(2)
+    });
+
+    // Upload ZIP to S3 for download
+    const zipKey = `bulk-downloads/${req.user.id}/${Date.now()}_merged_pdfs.zip`;
+    const zipUploadCommand = new PutObjectCommand({
+      Bucket: process.env.MINIO_BUCKET_NAME,
+      Key: zipKey,
+      Body: zipBuffer,
+      ContentType: 'application/zip',
+      ContentDisposition: `attachment; filename="bulk_merged_pdfs_${new Date().toISOString().split('T')[0]}.zip"`
+    });
+    
+    await s3.send(zipUploadCommand);
+    
+    // Generate signed download URL
+    const downloadCommand = new GetObjectCommand({
+      Bucket: process.env.MINIO_BUCKET_NAME,
+      Key: zipKey,
+      ResponseContentDisposition: `attachment; filename="bulk_merged_pdfs_${new Date().toISOString().split('T')[0]}.zip"`
+    });
+    
+    const downloadUrl = await getSignedUrl(s3, downloadCommand, { expiresIn: 3600 }); // 1 hour
+    
+    console.log('🎉 [MERGED PDF BULK] Bulk download completed successfully:', {
+      successCount,
+      failureCount,
+      totalRequested: mergedDocumentIds.length,
+      zipSizeMB: (zipBuffer.length / 1024 / 1024).toFixed(2)
+    });
+
+    res.json({
+      success: true,
+      downloadUrl,
+      summary: {
+        total: mergedDocumentIds.length,
+        successful: successCount,
+        failed: failureCount,
+        zipSizeMB: (zipBuffer.length / 1024 / 1024).toFixed(2)
+      },
+      results: downloadResults
+    });
+
+  } catch (error) {
+    console.error('❌ [MERGED PDF BULK] Bulk download failed:', error);
+    
+    let errorMessage = 'Failed to create bulk merged PDF download';
+    if (error.message.includes('timeout')) {
+      errorMessage = 'Download timeout - too many files or network issues';
+    } else if (error.message.includes('NoSuchKey')) {
+      errorMessage = 'Some merged PDF files are missing from storage';
+    } else if (error.message.includes('AccessDenied')) {
+      errorMessage = 'Access denied to some merged PDF files';
+    }
+    
+    res.status(500).json({
+      success: false,
+      error: errorMessage,
+      details: process.env.NODE_ENV === 'development' ? error.message : undefined
+    });
+  }
+});
+
 // Add this endpoint right after your JobDescription endpoint
 app.get('/api/job-descriptions/:jobDescriptionId', authenticateJWT, verifyOwnership(JobDescription), async (req, res) => {
 
@@ -3199,6 +3699,8 @@ const s3 = new S3Client({
   retryMode: 'standard'
 });
 
+// Make s3 instance globally accessible
+global.s3 = s3;
 
 // Test MinIO connection on startup
 const testMinIOConnection = async () => {
@@ -4706,6 +5208,29 @@ async function processAssessmentCompletion(sessionId, userId) {
     });
 
     console.log('Successfully processed assessment:', sessionId);
+    
+    // 4. AUTO-GENERATE MERGED PDF
+    // Trigger merged PDF generation automatically after report completion
+    try {
+      console.log(`🔄 [AUTO MERGED PDF] Automatically generating merged PDF for session: ${sessionId}`);
+      
+      // Generate merged PDF in background (don't block the response)
+      generateMergedPDF(sessionId, userId).then((mergedResult) => {
+        if (mergedResult.success) {
+          console.log(`✅ [AUTO MERGED PDF] Successfully generated merged PDF: ${mergedResult.mergedDocumentId}`);
+        } else {
+          console.log(`ℹ️ [AUTO MERGED PDF] Merged PDF already existed: ${mergedResult.mergedDocumentId}`);
+        }
+      }).catch((mergedError) => {
+        console.error(`❌ [AUTO MERGED PDF] Failed to auto-generate merged PDF for session ${sessionId}:`, mergedError.message);
+        // Don't throw - this shouldn't fail the main report process
+      });
+      
+    } catch (autoMergeError) {
+      console.error(`❌ [AUTO MERGED PDF] Error in auto-merge trigger for session ${sessionId}:`, autoMergeError.message);
+      // Don't throw - this shouldn't fail the main report process
+    }
+    
     return report;
   } catch (error) {
     // 4. Handle failures
@@ -6162,6 +6687,73 @@ app.get('/api/debug/scheduled-test/:id', async (req, res) => {
   }
 });
 
+// Update interview status (for external scheduling workflow)
+app.put('/api/interviews/update-status', authenticateJWT, async (req, res) => {
+  try {
+    const { assessmentSessionId, candidateId, status, platform } = req.body;
+    
+    console.log('🔄 Updating interview status:', {
+      assessmentSessionId,
+      candidateId,
+      status,
+      platform,
+      timestamp: new Date().toISOString()
+    });
+    
+    // 🔥 FIX: Find interview by ScheduledTest reference since Interview schema doesn't have assessmentSessionId
+    const sessionId = assessmentSessionId || candidateId;
+    
+    // First find the ScheduledTest for this session
+    const scheduledTest = await ScheduledTest.findOne({ assessmentSession: sessionId });
+    if (!scheduledTest) {
+      console.log('❌ ScheduledTest not found for session:', sessionId);
+      return res.status(404).json({
+        success: false,
+        error: 'No scheduled test found for this assessment session'
+      });
+    }
+    
+    // Find interview by ScheduledTest reference
+    const interview = await Interview.findOne({ scheduledTest: scheduledTest._id });
+    
+    if (!interview) {
+      console.log('❌ Interview not found for ScheduledTest:', scheduledTest._id);
+      return res.status(404).json({
+        success: false,
+        error: 'Interview not found for this assessment session'
+      });
+    }
+    
+    // Update interview status and platform
+    interview.status = status;
+    if (platform) {
+      interview.interviewPlatform = platform;
+    }
+    interview.updatedAt = new Date();
+    
+    await interview.save();
+    
+    console.log('✅ Interview status updated successfully:', {
+      interviewId: interview._id,
+      newStatus: status,
+      platform: interview.interviewPlatform
+    });
+    
+    res.status(200).json({
+      success: true,
+      message: 'Interview status updated successfully',
+      data: interview
+    });
+    
+  } catch (error) {
+    console.error('❌ Error updating interview status:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Failed to update interview status'
+    });
+  }
+});
+
 // Ensure an interview exists for a given assessment session (auto-create minimal records)
 app.post('/api/interviews/ensure-by-session', authenticateJWT, async (req, res) => {
   try {
@@ -6170,33 +6762,28 @@ app.post('/api/interviews/ensure-by-session', authenticateJWT, async (req, res) 
       return res.status(400).json({ success: false, error: 'assessmentSessionId or candidateId is required' });
     }
 
-    const session = await AssessmentSession.findById(assessmentSessionId || candidateId).populate('resumeId');
+    const sessionId = assessmentSessionId || candidateId;
+    console.log('🔍 Ensuring interview for session:', sessionId);
+
+    const session = await AssessmentSession.findById(sessionId).populate('resumeId');
     if (!session) {
       return res.status(404).json({ success: false, error: 'Assessment session not found' });
     }
 
-    // If interview already exists for this session, return it
-    let interview = await Interview.findOne({ assessmentSessionId: session._id });
-    if (interview) {
-      return res.json({ success: true, data: interview, existed: true });
+    // 🔥 ENHANCED FIX: First check for existing interview by ScheduledTest reference
+    // Since Interview schema doesn't have candidateId/assessmentSessionId, we need to find via ScheduledTest
+    let scheduledTest = await ScheduledTest.findOne({ assessmentSession: sessionId });
+    
+    if (scheduledTest) {
+      // Check if interview already exists for this scheduled test
+      const existingInterview = await Interview.findOne({ scheduledTest: scheduledTest._id });
+      if (existingInterview) {
+        console.log('✅ Found existing interview via ScheduledTest:', existingInterview._id, 'Status:', existingInterview.status);
+        return res.json({ success: true, data: existingInterview, existed: true });
+      }
     }
 
-    // Try to locate an existing ScheduledTest linked to this session (if schema supports it)
-    let scheduledTest = await ScheduledTest.findOne({ assessmentSession: session._id });
-    if (!scheduledTest) {
-      // Create a lightweight placeholder scheduled test to satisfy Interview schema
-      scheduledTest = new ScheduledTest({
-        candidateName: session.resumeId?.name || session.candidateEmail || 'Candidate',
-        candidateEmail: session.candidateEmail,
-        jobTitle: session.jobTitle || 'Position',
-        status: 'completed',
-        assessmentSession: session._id,
-        scheduledDateTime: new Date(),
-        expiresAt: new Date(Date.now() + 24*60*60*1000),
-        user: req.user.id
-      });
-      await scheduledTest.save();
-    }
+    console.log('🔄 No existing interview found, creating new one with schema-compliant approach...');
 
     const candidateName = session.resumeId?.name || session.candidateEmail || 'Candidate';
     const candidateEmail = session.candidateEmail;
@@ -6205,26 +6792,104 @@ app.post('/api/interviews/ensure-by-session', authenticateJWT, async (req, res) 
     const interviewPlatform = 'Google Calendar';
     const meetingLink = `https://calendar.google.com/calendar/render?action=TEMPLATE&add=${encodeURIComponent(candidateEmail)}&text=${encodeURIComponent(`Interview - ${jobTitle}`)}`;
 
-    interview = new Interview({
-      scheduledTest: scheduledTest._id,
-      candidateName,
-      candidateEmail,
-      jobTitle,
-      interviewDateTime,
-      interviewPlatform,
-      meetingLink,
-      scheduledBy: req.user.id,
-      // Also include these fields when the schema supports them
-      candidateId: session._id,
-      assessmentSessionId: session._id,
-      status: 'scheduled',
-      duration: 60
-    });
-    await interview.save();
+    // Create or find ScheduledTest first (required by Interview schema)
+    if (!scheduledTest) {
+      // Use atomic operation to prevent duplicate scheduled tests
+      try {
+        scheduledTest = await ScheduledTest.findOneAndUpdate(
+          { assessmentSession: sessionId }, // Find criteria
+          {
+            candidateName,
+            candidateEmail,
+            jobTitle,
+            status: 'completed',
+            assessmentSession: sessionId,
+            scheduledDateTime: new Date(),
+            expiresAt: new Date(Date.now() + 24*60*60*1000),
+            user: req.user.id,
+            token: `auto-${sessionId}-${Date.now()}`,
+            testLink: `auto-generated-${sessionId}`,
+            resumeId: session.resumeId?._id,
+            jobDescriptionId: session.jobDescriptionId
+          },
+          { 
+            upsert: true, // Create if doesn't exist
+            new: true,    // Return the new document
+            setDefaultsOnInsert: true // Apply defaults on insert
+          }
+        );
+        console.log('📅 Created/found scheduled test with atomic operation:', scheduledTest._id);
+      } catch (scheduledTestError) {
+        console.error('❌ Error creating scheduled test:', scheduledTestError);
+        // If scheduled test creation fails, try to find existing one
+        scheduledTest = await ScheduledTest.findOne({ assessmentSession: sessionId });
+        if (!scheduledTest) {
+          return res.status(500).json({ success: false, error: 'Failed to create required scheduled test' });
+        }
+      }
+    }
 
-    return res.status(201).json({ success: true, data: interview, created: true });
+    // 🔥 ENHANCED FIX: Use atomic findOneAndUpdate with proper schema fields only
+    try {
+      // Double-check for existing interview after ScheduledTest creation
+      let interview = await Interview.findOne({ scheduledTest: scheduledTest._id });
+      if (interview) {
+        console.log('✅ Found existing interview after ScheduledTest creation:', interview._id);
+        return res.json({ success: true, data: interview, existed: true });
+      }
+
+      // Create interview with schema-compliant fields only
+      interview = await Interview.findOneAndUpdate(
+        {
+          scheduledTest: scheduledTest._id // Use only schema-compliant query
+        },
+        {
+          // Only use fields that exist in InterviewSchema
+          scheduledTest: scheduledTest._id,
+          candidateName,
+          candidateEmail,
+          jobTitle,
+          interviewDateTime,
+          interviewPlatform,
+          meetingLink,
+          scheduledBy: req.user.id,
+          status: 'not-scheduled', // 🔥 FIX: Start with 'not-scheduled' status
+          createdAt: new Date(),
+          updatedAt: new Date()
+        },
+        {
+          upsert: true, // Create if doesn't exist
+          new: true,    // Return the new document
+          setDefaultsOnInsert: true // Apply defaults on insert
+        }
+      );
+      
+      const isNewInterview = !interview.createdAt || (new Date() - interview.createdAt) < 1000;
+      console.log(isNewInterview ? '✅ Created new interview with atomic operation:' : '✅ Found existing interview during atomic operation:', interview._id, 'Status:', interview.status);
+
+      return res.status(isNewInterview ? 201 : 200).json({ 
+        success: true, 
+        data: interview, 
+        created: isNewInterview,
+        existed: !isNewInterview 
+      });
+      
+    } catch (interviewError) {
+      console.error('❌ Error in atomic interview creation:', interviewError);
+      
+      // Final fallback: try to find any existing interview by ScheduledTest
+      const existingInterview = await Interview.findOne({ scheduledTest: scheduledTest._id });
+      
+      if (existingInterview) {
+        console.log('🔄 Fallback: Found existing interview after error:', existingInterview._id);
+        return res.json({ success: true, data: existingInterview, existed: true });
+      }
+      
+      throw interviewError; // Re-throw if no existing interview found
+    }
+
   } catch (error) {
-    console.error('Error ensuring interview:', error);
+    console.error('❌ Error ensuring interview:', error);
     return res.status(500).json({ success: false, error: 'Failed to ensure interview' });
   }
 });
@@ -6439,15 +7104,20 @@ app.post('/api/interviews/feedback', authenticateJWT, async (req, res) => {
       });
     }
     
-    // Ensure an interview exists for this assessment session. Different deployments
-    // have different Interview schemas (some require scheduledTest/candidateEmail/etc.).
-    // To avoid schema validation failures, DO NOT create a new Interview here.
-    // Instead, require an existing record and update it.
-    let interview = await Interview.findOne({ assessmentSessionId });
-    if (!interview) {
-      // Try a fallback query by candidateId as well
-      interview = await Interview.findOne({ candidateId, assessmentSessionId });
+    // 🔥 FIX: Find interview by ScheduledTest reference since Interview schema doesn't have assessmentSessionId
+    const sessionId = assessmentSessionId || candidateId;
+    
+    // First find the ScheduledTest for this session
+    const scheduledTest = await ScheduledTest.findOne({ assessmentSession: sessionId });
+    if (!scheduledTest) {
+      return res.status(400).json({
+        success: false,
+        error: 'No scheduled test found for this assessment session. Please schedule an interview before submitting feedback.'
+      });
     }
+    
+    // Find interview by ScheduledTest reference
+    let interview = await Interview.findOne({ scheduledTest: scheduledTest._id });
     if (!interview) {
       return res.status(400).json({
         success: false,
@@ -6485,6 +7155,12 @@ app.post('/api/interviews/feedback', authenticateJWT, async (req, res) => {
     });
   }
 });
+
+// ==============================
+// ✅ OFFER LETTER FUNCTIONALITY
+// ==============================
+
+const { sendSelectionEmail, generateOfferLetter, sendOfferLetter, getRequiredDocuments } = require('./services/offerLetterService');
 
 // Update interview feedback and status
 app.put('/api/interviews/:id', authenticateJWT, async (req, res) => {
@@ -7207,10 +7883,45 @@ app.get('/api/candidates/:candidateId/details', authenticateJWT, async (req, res
       });
     }
     
-    // Create candidate data from resume and assessment
+    // Create candidate data from assessment with enhanced name parsing
     const candidate = {
-      _id: assessment._id, // Use assessment session ID as candidate ID
-      name: assessment.resumeId?.name || assessment.candidateEmail,
+      _id: assessment._id,
+      name: (() => {
+        // Enhanced name parsing logic - consistent with frontend
+        let displayName = 'Unknown Candidate';
+        
+        // Priority: 1. Check if resumeId.name exists and is not an email
+        if (assessment.resumeId?.name && typeof assessment.resumeId.name === 'string' && assessment.resumeId.name.trim()) {
+          const nameValue = assessment.resumeId.name.trim();
+          // If name is not in email format, use it directly
+          if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(nameValue)) {
+            displayName = nameValue;
+          } else {
+            // If name field contains email, parse it for display
+            const emailParts = nameValue.split('@')[0].replace(/[._-]/g, ' ');
+            const prettyName = emailParts
+              .split(' ')
+              .filter(Boolean)
+              .map(w => w.charAt(0).toUpperCase() + w.slice(1).toLowerCase())
+              .join(' ')
+              .trim();
+            displayName = prettyName || 'Candidate';
+          }
+        }
+        // Priority: 2. If no proper name, use candidateEmail for parsing
+        else if (assessment.candidateEmail && typeof assessment.candidateEmail === 'string' && assessment.candidateEmail.includes('@')) {
+          const emailParts = assessment.candidateEmail.split('@')[0].replace(/[._-]/g, ' ');
+          const prettyName = emailParts
+            .split(' ')
+            .filter(Boolean)
+            .map(w => w.charAt(0).toUpperCase() + w.slice(1).toLowerCase())
+            .join(' ')
+            .trim();
+          displayName = prettyName || 'Candidate';
+        }
+        
+        return displayName;
+      })(),
       email: assessment.candidateEmail,
       mobile_number: assessment.resumeId?.mobile_number,
       experience: assessment.resumeId?.experience || assessment.resumeId?.total_experience,
@@ -7264,13 +7975,48 @@ app.post('/api/interviews/schedule', authenticateJWT, async (req, res) => {
       });
     }
     
-    // Create candidate data from assessment
+    // Create candidate data from assessment with consistent name parsing
     const candidate = {
       _id: assessment._id,
-      name: assessment.resumeId?.name || assessment.candidateEmail,
+      name: (() => {
+        // Enhanced name parsing logic - consistent with other endpoints
+        let displayName = 'Unknown Candidate';
+        
+        // Priority: 1. Check if resumeId.name exists and is not an email
+        if (assessment.resumeId?.name && typeof assessment.resumeId.name === 'string' && assessment.resumeId.name.trim()) {
+          const nameValue = assessment.resumeId.name.trim();
+          // If name is not in email format, use it directly
+          if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(nameValue)) {
+            displayName = nameValue;
+          } else {
+            // If name field contains email, parse it for display
+            const emailParts = nameValue.split('@')[0].replace(/[._-]/g, ' ');
+            const prettyName = emailParts
+              .split(' ')
+              .filter(Boolean)
+              .map(w => w.charAt(0).toUpperCase() + w.slice(1).toLowerCase())
+              .join(' ')
+              .trim();
+            displayName = prettyName || 'Candidate';
+          }
+        }
+        // Priority: 2. If no proper name, use candidateEmail for parsing
+        else if (assessment.candidateEmail && typeof assessment.candidateEmail === 'string' && assessment.candidateEmail.includes('@')) {
+          const emailParts = assessment.candidateEmail.split('@')[0].replace(/[._-]/g, ' ');
+          const prettyName = emailParts
+            .split(' ')
+            .filter(Boolean)
+            .map(w => w.charAt(0).toUpperCase() + w.slice(1).toLowerCase())
+            .join(' ')
+            .trim();
+          displayName = prettyName || 'Candidate';
+        }
+        
+        return displayName;
+      })(),
       email: assessment.candidateEmail
     };
-    
+
     // Send interview invite
     const { sendInterviewInvite } = require('./services/interviewService');
     await sendInterviewInvite({
@@ -7328,7 +8074,7 @@ app.post('/api/candidates/select', authenticateJWT, async (req, res) => {
     // Create candidate data from assessment
     const candidate = {
       _id: assessment._id, // Use assessment session ID as candidate ID
-      name: assessment.resumeId?.name || assessment.candidateEmail,
+      name: assessment.resumeId?.name || assessment.candidateEmail?.split('@')[0]?.replace(/[._-]/g, ' ') || 'Candidate',
       email: assessment.candidateEmail
     };
     
@@ -7466,345 +8212,328 @@ app.post('/api/offers/draft', authenticateJWT, async (req, res) => {
       return res.status(404).json({ success: false, error: 'Assessment session not found' });
     }
 
+    // Load offer letter templates
+    const { getOfferLetterTemplate, generateProfessionalTemplate, generateExecutiveTemplate, generateStartupTemplate, generateFormalTemplate } = require('./services/offerLetterService');
+    
+    // Define templates object
+    const templates = {
+      professional: generateProfessionalTemplate,
+      executive: generateExecutiveTemplate,
+      startup: generateStartupTemplate,
+      formal: generateFormalTemplate
+    };
+
     const user = await User.findById(req.user.id);
     const candidateName = offerData?.candidateName || assessment.resumeId?.name || assessment.candidateEmail || 'Candidate';
     const jobTitle = offerData?.position || assessment.jobTitle || 'Position';
     const companyName = offerData?.companyName || user?.companyName || 'Your Company';
     const today = new Date().toLocaleDateString();
 
-    const tpl = (template || 'branded').toLowerCase();
+    const offerTemplate = templates[template];
+    if (!offerTemplate) {
+      return res.status(400).json({ success: false, error: 'Invalid template' });
+    }
 
-    // Branded multi-page HTML with placeholders, A4 width and page breaks
-    const branded = `
-<!DOCTYPE html>
-<html>
-<head>
-  <meta charset="utf-8" />
-  <style>
-    @page { size: A4; margin: 0; }
-    :root { --brand:#16a34a; --brand2:#2dd4bf; --text:#111827; }
-    html, body { margin:0; padding:0; color:var(--text); font-family: Inter, Arial, sans-serif; }
-    .page { width: 794px; min-height: 1123px; margin: 24px auto; background: #fff; position: relative; border: 1px solid #e5e7eb; box-shadow: 0 8px 24px rgba(0,0,0,0.08); }
-    .content { padding: 32px 40px 64px 40px; }
-    .header { display:flex; justify-content: space-between; align-items:center; border-bottom: 3px solid #e5e7eb; padding-bottom: 8px; }
-    .brand { display:flex; align-items:center; gap:12px; }
-    .brand .name { font-size: 22px; font-weight: 800; color: var(--brand); }
-    .brand .tag { font-size: 12px; color:#6b7280; }
-    .site { font-weight:600; color:#0f766e; }
-    .section-title { font-size: 16px; font-weight: 700; margin: 18px 0 8px; }
-    .muted { color:#6b7280; }
-    .table { width:100%; border-collapse: collapse; font-size: 12px; }
-    .table th, .table td { border:1px solid #d1d5db; padding:8px; }
-    .table th { background:#f3f4f6; text-align:left; }
-    .two-col { display:flex; gap:16px; }
-    .col { flex:1; }
-    .footer { position:absolute; bottom:10px; right:20px; font-size:11px; color:#6b7280; }
-    .page-break { page-break-after: always; }
-    ul.terms { margin: 8px 0 0 18px; }
-    ul.terms li { margin-bottom: 8px; line-height: 1.4; }
-    .sign { margin-top: 28px; }
-    .edge-band { position:absolute; left:0; top:0; bottom:0; width:10px; background: linear-gradient(180deg, var(--brand), var(--brand2)); }
-  </style>
-  </head>
-  <body>
-    <!-- Page 1 -->
-    <div class="page">
-      <div class="edge-band"></div>
-      <div class="content">
-        <div class="header">
-          <div class="brand">
-            <div class="name">${companyName}</div>
-            <div class="tag">Offer of Employment</div>
-          </div>
-          <div class="site">${(user?.companyWebsite || 'www.company.com').toUpperCase()}</div>
-        </div>
-        <div style="text-align:right; margin-top:8px;" class="muted">${today}</div>
+    const offerHtml = offerTemplate({
+      candidateName,
+      jobTitle,
+      companyName,
+      today,
+      position: offerData.position,
+      salary: offerData.salary,
+      startDate: offerData.startDate,
+      benefits: offerData.benefits,
+      notes: offerData.notes,
+      hrName: user.fullName,
+      hrEmail: user.email
+    });
 
-        <h2 style="text-align:center; margin:20px 0 10px; text-decoration: underline;">OFFER LETTER</h2>
+    res.status(200).json({
+      success: true,
+      offerHtml
+    });
 
-        <div style="margin-top: 10px;">
-          <div>To,</div>
-          <div><strong>{{candidateFullBlock}}</strong></div>
-        </div>
-
-        <p style="margin-top: 12px;">Dear <strong>${candidateName}</strong>,</p>
-
-        <p><strong>Subject:</strong> Appointment Letter for employment at ${companyName} – Regarding;</p>
-        <p class="muted"><strong>Reference:</strong> Your Application & Subsequent interview on {{interviewDate}}</p>
-
-        <p>We are pleased to appoint you as <strong>"${jobTitle}"</strong> in ${companyName} solutions on the following employment terms:</p>
-
-        <p><strong>Date of Joining:</strong> {{startDate}}</p>
-        <p><strong>Salary:</strong> {{salary}} (per annum)</p>
-
-        <p><strong>Place of Work:</strong> Your present place of work with beat place, but during the course of the employment you may be transferred anywhere as per the needs of the company.</p>
-
-        <p><strong>Probation/Confirmation:</strong> You will be on probation for a period of three months from the date of joining, extendable based on performance. During probation, services may be terminated with seven days’ notice. Upon confirmation, standard notice periods will apply.</p>
-
-        <div class="footer">Page 1 of 5</div>
-      </div>
-    </div>
-
-    <!-- Page 2 -->
-    <div class="page page-break">
-      <div class="content">
-        <p>Absence for a continuous period of ten days without prior approval may result in disciplinary action per company policy.</p>
-
-        <p><strong>Leave:</strong> You are eligible for company leave rules. Total leaves per year: 12, excluding 6 medical leaves.</p>
-
-        <div class="section-title">Terms & Conditions</div>
-        <ul class="terms">
-          <li>You will not publish or make public any material related to the company’s product or projects without written permission.</li>
-          <li>Maintain utmost secrecy of project documents, commercial offers, design docs, estimates, and intellectual property.</li>
-          <li>Comply with all rules and regulations issued by the company.</li>
-          <li>Do not disclose confidential information during or after employment.</li>
-          <li>Your current place of posting is as per HR communication; disciplinary actions may be taken for violations.</li>
-          <li>Employee agrees to a bond of not leaving the company for a minimum period of one year from the date of joining.</li>
-          <li>Non-compete: You agree not to compete with the company during employment and for one year following termination.</li>
-          <li>Do not accept any present, commission, or gratification from clients or vendors.</li>
-          <li>Report any offer of bribery or favors immediately to management.</li>
-          <li>Appointment is based on true information; misrepresentation may lead to termination.</li>
-          <li>Return all company property in good condition upon separation.</li>
-          <li>Increment eligibility is based on performance and at discretion of management.</li>
-          <li>Company may withdraw appointment during probation with cause.</li>
-          <li>Notice period is three months or salary in lieu thereof, subject to company policy.</li>
-          <li>Poor performance/discipline may lead to termination without compensation.</li>
-          <li>Follow instructions/duties assigned by management.</li>
-          <li>Sign and return a copy of this offer letter as acceptance before joining.</li>
-        </ul>
-
-        <p style="margin-top: 18px;">We are confident you will meet expectations and contribute to the organization’s growth.</p>
-
-        <div class="footer">Page 2 of 5</div>
-      </div>
-    </div>
-
-    <!-- Page 3 (Signature) -->
-    <div class="page page-break">
-      <div class="content">
-        <p>Once again, we welcome you to ${companyName} and look forward to a fruitful association with you.</p>
-
-        <div class="two-col sign">
-          <div class="col">
-            <div><strong>For ${companyName}</strong></div>
-            <div style="margin-top:40px;">${user?.fullName || 'Authorized Signatory'}</div>
-            <div class="muted">${user?.email || ''}</div>
-            <div class="muted">${companyName}</div>
-          </div>
-          <div class="col" style="text-align:right;">
-            <div><strong>Accepted</strong></div>
-            <div style="margin-top:40px;">______________________________</div>
-          </div>
-        </div>
-
-        <div class="footer">Page 3 of 5</div>
-      </div>
-    </div>
-
-    <!-- Page 4 (Salary Breakup) -->
-    <div class="page page-break">
-      <div class="content">
-        <div class="section-title">Designation: "${jobTitle}"</div>
-        <div class="section-title">Salary Break-up</div>
-
-        <div class="two-col">
-          <div class="col">
-            <table class="table">
-              <thead><tr><th>Earnings</th><th>Amount</th></tr></thead>
-              <tbody>
-                {{earningsRows}}
-                <tr><td><strong>Total Earnings</strong></td><td><strong>{{totalEarnings}}</strong></td></tr>
-              </tbody>
-            </table>
-          </div>
-          <div class="col">
-            <table class="table">
-              <thead><tr><th>Deductions</th><th>Amount</th></tr></thead>
-              <tbody>
-                {{deductionsRows}}
-                <tr><td><strong>Total Deductions</strong></td><td><strong>{{totalDeductions}}</strong></td></tr>
-              </tbody>
-            </table>
-          </div>
-        </div>
-
-        <div style="margin-top: 14px;">
-          <div><strong>Net Salary:</strong> {{netSalary}}</div>
-          <div><strong>Your Annual Take Home Salary:</strong> {{annualTakeHome}}</div>
-          <div><strong>Your Annual CTC:</strong> {{salary}}</div>
-        </div>
-
-        <p style="margin-top: 16px;">Your Annual CTC in words: <em>{{salaryInWords}}</em></p>
-
-        <div class="footer">Page 4 of 5</div>
-      </div>
-    </div>
-
-    <!-- Page 5 (Acceptance) -->
-    <div class="page">
-      <div class="content">
-        <p style="margin-top: 28px;">Accepted</p>
-        <div style="margin-top: 40px;">______________________________</div>
-        <div class="footer">Page 5 of 5</div>
-      </div>
-    </div>
-  </body>
-</html>`;
-
-    // Appointment template - toned down brand, strong letterhead with edge band
-    const appointment = `
-<!DOCTYPE html>
-<html>
-<head>
-  <meta charset="utf-8" />
-  <style>
-    @page { size: A4; margin: 0; }
-    :root { --brand:#1d4ed8; --brand2:#60a5fa; }
-    html, body { margin:0; padding:0; color:#111827; font-family: Georgia, 'Times New Roman', serif; }
-    .page { width: 794px; min-height: 1123px; margin: 24px auto; background: #fff; border:1px solid #e5e7eb; box-shadow: 0 8px 24px rgba(0,0,0,0.08); position:relative; }
-    .edge-band { position:absolute; left:0; top:0; bottom:0; width:10px; background: linear-gradient(180deg, var(--brand), var(--brand2)); }
-    .content { padding: 48px 56px; }
-    .letterhead { border-bottom: 2px solid #e5e7eb; padding-bottom: 8px; margin-bottom: 16px; display:flex; justify-content:space-between; align-items:end; }
-    .company { font-size: 22px; font-weight:700; }
-    .muted { color:#6b7280; }
-    .section-title { font-weight:700; margin-top: 18px; }
-    .footer { text-align:right; color:#6b7280; font-size: 11px; margin-top: 12px; }
-    .table { width:100%; border-collapse: collapse; font-size: 12px; margin-top:8px }
-    .table th, .table td { border:1px solid #d1d5db; padding:8px; }
-    .table th { background:#f9fafb; text-align:left; }
-  </style>
-  </head>
-  <body>
-    <div class="page">
-      <div class="edge-band"></div>
-      <div class="content">
-        <div class="letterhead">
-          <div class="company">${companyName}</div>
-          <div class="muted">${(user?.companyWebsite || 'www.company.com')}</div>
-        </div>
-        <div class="muted" style="text-align:right;">${today}</div>
-        <h2 style="text-align:center; margin:18px 0; text-decoration: underline;">APPOINTMENT LETTER</h2>
-        <p>Dear <strong>${candidateName}</strong>,</p>
-        <p>We are pleased to offer you the role of <strong>${jobTitle}</strong> at <strong>${companyName}</strong>. Please find below the terms of your employment:</p>
-        <p><strong>Date of Joining:</strong> {{startDate}}</p>
-        <p><strong>Annual CTC:</strong> {{salary}}</p>
-        <div class="section-title">Terms & Conditions</div>
-        <div>{{termsBlock}}</div>
-        <div class="section-title">Salary Break-up</div>
-        <table class="table">
-          <thead><tr><th>Earnings</th><th>Amount</th><th>Deductions</th><th>Amount</th></tr></thead>
-          <tbody>{{salaryMatrix}}</tbody>
-        </table>
-        <p class="footer">Generated on ${today}</p>
-      </div>
-    </div>
-  </body>
-</html>`;
-
-    // Simple template - single page, minimal styling with edge band and border
-    const simple = `
-<!DOCTYPE html>
-<html>
-<head>
-  <meta charset=\"utf-8\" />
-  <style>
-    @page { size: A4; margin: 0; }
-    :root { --brand:#047857; --brand2:#34d399; }
-    body { font-family: Arial, sans-serif; color:#111827; margin:0; background:#f3f4f6; }
-    .page { width: 794px; min-height: 1123px; margin: 24px auto; background: #fff; border:1px solid #e5e7eb; box-shadow: 0 8px 24px rgba(0,0,0,0.08); position:relative; }
-    .edge-band { position:absolute; left:0; top:0; bottom:0; width:8px; background: linear-gradient(180deg, var(--brand), var(--brand2)); }
-    .content { padding: 40px 44px; }
-    h1 { font-size: 18px; text-align:center; text-decoration: underline; }
-    .muted { color:#6b7280; }
-    table { width:100%; border-collapse: collapse; font-size: 12px; margin-top:10px }
-    th, td { border:1px solid #d1d5db; padding:6px; text-align:left; }
-    th { background:#f3f4f6 }
-  </style>
-  </head>
-  <body>
-    <div class=\"page\">
-      <div class=\"edge-band\"></div>
-      <div class=\"content\">
-        <div style=\"text-align:right\" class=\"muted\">${today}</div>
-        <h1>Offer Letter</h1>
-        <p>Dear <strong>${candidateName}</strong>,</p>
-        <p>We are pleased to offer you the position of <strong>${jobTitle}</strong> at <strong>${companyName}</strong>.</p>
-        <p><strong>Start Date:</strong> {{startDate}} &nbsp; | &nbsp; <strong>Salary:</strong> {{salary}}</p>
-        <div><strong>Terms:</strong></div>
-        <div>{{termsBlock}}</div>
-        <div style=\"margin-top:10px\"><strong>Salary Break-up</strong></div>
-        <table>
-          <thead><tr><th>Earnings</th><th>Amount</th><th>Deductions</th><th>Amount</th></tr></thead>
-          <tbody>{{salaryMatrix}}</tbody>
-        </table>
-        <p class=\"muted\" style=\"margin-top:12px\">This is a system-generated draft.</p>
-      </div>
-    </div>
-  </body>
-</html>`;
-
-// Helpers to format values and fill placeholders
-const formatDate = (dateStr) => {
-  if (!dateStr) return '';
-  try {
-    return new Date(dateStr).toLocaleDateString('en-IN', { day: 'numeric', month: 'long', year: 'numeric' });
-  } catch {
-    return String(dateStr);
-  }
-};
-
-const formatSalary = (amount, currency = (offerData?.currency || 'INR')) => {
-  if (amount === undefined || amount === null || amount === '') return '';
-  const n = Number(amount);
-  const formatted = isNaN(n) ? String(amount) : n.toLocaleString('en-IN');
-  const symbol = currency === 'INR' ? '₹' : (currency === 'USD' ? '$' : currency);
-  return `${symbol}${formatted}`;
-};
-
-const buildCandidateFullBlock = () => {
-  const parts = [
-    candidateName,
-    offerData?.candidateEmail,
-    offerData?.candidateAddress
-  ].filter(Boolean);
-  return parts.join('<br/>');
-};
-
-const buildSalarySection = () => {
-  const salaryFmt = formatSalary(offerData?.salary);
-  return {
-    earningsRows: '',
-    deductionsRows: '',
-    totalEarnings: salaryFmt,
-    totalDeductions: '0',
-    netSalary: salaryFmt,
-    annualTakeHome: salaryFmt,
-    salaryInWords: ''
-  };
-};
-
-const fillTemplate = (html, map) =>
-  Object.entries(map).reduce((acc, [k, v]) => acc.replace(new RegExp(`\\{{2}${k}\\}{2}`, 'g'), v ?? ''), html);
-// Choose the raw template
-const rawHtml = tpl === 'appointment' ? appointment : tpl === 'simple' ? simple : branded;
-
-// Build replacements from offerData
-const filled = fillTemplate(rawHtml, {
-  candidateFullBlock: buildCandidateFullBlock(),
-  startDate: formatDate(offerData?.startDate),
-  interviewDate: formatDate(offerData?.interviewDate),
-  salary: formatSalary(offerData?.salary),
-  termsBlock: '',
-  salaryMatrix: '',
-  ...buildSalarySection()
-});
-
-return res.json({ success: true, draftHtml: filled });
   } catch (error) {
     console.error('Error generating offer draft:', error);
-    return res.status(500).json({ success: false, error: 'Failed to generate draft' });
+    res.status(500).json({
+      success: false,
+      error: 'Failed to generate offer draft'
+    });
   }
 });
+
+// Document Collection Endpoints
+app.post('/api/candidates/:candidateId/request-documents', authenticateJWT, async (req, res) => {
+  try {
+    const { candidateId } = req.params;
+    const { assessmentSessionId, documentTypes, customMessage, template } = req.body;
+    
+    // Get assessment session data
+    const assessment = await AssessmentSession.findById(assessmentSessionId || candidateId)
+      .populate('resumeId');
+    
+    if (!assessment) {
+      return res.status(404).json({
+        success: false,
+        error: 'Assessment session not found'
+      });
+    }
+    
+    // Get user data for company info
+    const user = await User.findById(req.user.id);
+    
+    // Create candidate data from assessment
+    const candidate = {
+      name: assessment.resumeId?.name || assessment.candidateEmail,
+      email: assessment.candidateEmail
+    };
+    
+    // Send document collection email to candidate
+    const { sendDocumentCollectionEmail } = require('./services/interviewService');
+    
+    await sendDocumentCollectionEmail({
+      candidateName: candidate.name,
+      candidateEmail: candidate.email,
+      companyName: user.companyName,
+      documentTypes,
+      customMessage,
+      template,
+      templateId: template, // If template is a string ID, use it
+      userId: req.user.id
+    });
+    
+    // If template is a user-defined template ID, validate it
+    let templateToUse = template;
+    if (template && !['standard', 'formal', 'friendly'].includes(template)) {
+      // This is likely a user-defined template ID
+      try {
+        const { getTemplateById } = require('./services/documentTemplateService');
+        const userTemplate = await getTemplateById(template, req.user.id);
+        if (!userTemplate) {
+          templateToUse = 'standard'; // Fallback to standard if template not found
+        }
+      } catch (error) {
+        console.error('Error validating user template:', error);
+        templateToUse = 'standard'; // Fallback to standard if validation fails
+      }
+    }
+    
+    // Create document collection record
+    const documentCollection = new DocumentCollection({
+      candidateId,
+      assessmentSessionId,
+      requestedBy: req.user.id,
+      documentTypes,
+      customMessage,
+      template: templateToUse,
+      status: 'requested',
+      requestedAt: new Date()
+    });
+    
+    await documentCollection.save();
+    
+    res.status(200).json({
+      success: true,
+      message: 'Document collection request sent successfully',
+      data: documentCollection
+    });
+    
+  } catch (error) {
+    console.error('Error requesting documents:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Failed to request documents'
+    });
+  }
+});
+
+// Get user templates for document collection
+app.get('/api/document-collection/templates', authenticateJWT, async (req, res) => {
+  try {
+    const { getUserTemplates } = require('./services/documentTemplateService');
+    const templates = await getUserTemplates(req.user.id);
+    
+    res.status(200).json({
+      success: true,
+      data: templates
+    });
+  } catch (error) {
+    console.error('Error fetching templates:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Failed to fetch templates'
+    });
+  }
+});
+
+// Create a new document collection template
+app.post('/api/document-collection/templates', authenticateJWT, async (req, res) => {
+  try {
+    const { createTemplate } = require('./services/documentTemplateService');
+    const templateData = req.body;
+    
+    // Add user ID to template data
+    templateData.userId = req.user.id;
+    
+    const template = await createTemplate(templateData);
+    
+    res.status(201).json({
+      success: true,
+      message: 'Template created successfully',
+      data: template
+    });
+  } catch (error) {
+    console.error('Error creating template:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Failed to create template'
+    });
+  }
+});
+
+// Update a document collection template
+app.put('/api/document-collection/templates/:templateId', authenticateJWT, async (req, res) => {
+  try {
+    const { updateTemplate } = require('./services/documentTemplateService');
+    const { templateId } = req.params;
+    const templateData = req.body;
+    
+    const template = await updateTemplate(templateId, templateData, req.user.id);
+    
+    if (!template) {
+      return res.status(404).json({
+        success: false,
+        error: 'Template not found'
+      });
+    }
+    
+    res.status(200).json({
+      success: true,
+      message: 'Template updated successfully',
+      data: template
+    });
+  } catch (error) {
+    console.error('Error updating template:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Failed to update template'
+    });
+  }
+});
+
+// Delete a document collection template
+app.delete('/api/document-collection/templates/:templateId', authenticateJWT, async (req, res) => {
+  try {
+    const { deleteTemplate } = require('./services/documentTemplateService');
+    const { templateId } = req.params;
+    
+    const result = await deleteTemplate(templateId, req.user.id);
+    
+    if (!result) {
+      return res.status(404).json({
+        success: false,
+        error: 'Template not found'
+      });
+    }
+    
+    res.status(200).json({
+      success: true,
+      message: 'Template deleted successfully'
+    });
+  } catch (error) {
+    console.error('Error deleting template:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Failed to delete template'
+    });
+  }
+});
+
+// Endpoint to upload documents
+app.post('/api/candidates/:candidateId/upload-documents', authenticateJWT, upload.array('documents'), async (req, res) => {
+  try {
+    const { candidateId } = req.params;
+    const { documentCollectionId } = req.body;
+    const files = req.files;
+    
+    if (!files || files.length === 0) {
+      return res.status(400).json({
+        success: false,
+        error: 'No documents uploaded'
+      });
+    }
+    
+    // Upload documents to S3
+    const uploadedDocuments = [];
+    for (const file of files) {
+      const s3Key = `candidate-documents/${candidateId}/${Date.now()}_${file.originalname}`;
+      await uploadToS3(file.buffer, s3Key, file.mimetype);
+      
+      uploadedDocuments.push({
+        name: file.originalname,
+        s3Key,
+        type: file.mimetype,
+        size: file.size,
+        uploadedAt: new Date()
+      });
+    }
+    
+    // Update document collection record
+    const documentCollection = await DocumentCollection.findById(documentCollectionId);
+    if (documentCollection) {
+      documentCollection.documents = uploadedDocuments;
+      documentCollection.status = 'uploaded';
+      documentCollection.uploadedAt = new Date();
+      await documentCollection.save();
+    }
+    
+    res.status(200).json({
+      success: true,
+      message: 'Documents uploaded successfully',
+      data: {
+        documentCollectionId,
+        documents: uploadedDocuments
+      }
+    });
+    
+  } catch (error) {
+    console.error('Error uploading documents:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Failed to upload documents'
+    });
+  }
+});
+
+// Endpoint to get document collection status
+app.get('/api/candidates/:candidateId/document-collection/:documentCollectionId', authenticateJWT, async (req, res) => {
+  try {
+    const { candidateId, documentCollectionId } = req.params;
+    
+    const documentCollection = await DocumentCollection.findById(documentCollectionId);
+    if (!documentCollection) {
+      return res.status(404).json({
+        success: false,
+        error: 'Document collection not found'
+      });
+    }
+    
+    res.status(200).json({
+      success: true,
+      data: documentCollection
+    });
+    
+  } catch (error) {
+    console.error('Error fetching document collection:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Failed to fetch document collection'
+    });
+  }
+});
+
+
+
 
 // Finalize edited HTML -> PDF + email (optional alternative to /api/candidates/select)
 app.post('/api/offers/finalize', authenticateJWT, async (req, res) => {
@@ -7824,112 +8553,113 @@ app.post('/api/offers/finalize', authenticateJWT, async (req, res) => {
 
     // naive sanitization (replace with sanitize-html in production)
     const safeHtml = String(editedHtml).replace(/<script[\s\S]*?<\/script>/gi, '');
-   // Helpers to format values and fill placeholders
-   const formatDate = (dateStr) => {
-    if (!dateStr) return '';
-    try {
-      return new Date(dateStr).toLocaleDateString('en-IN', { day: 'numeric', month: 'long', year: 'numeric' });
-    } catch {
-      return String(dateStr);
-    }
-  };
-  
-  const formatSalary = (amount, currency = (offerData?.currency || 'INR')) => {
-    if (amount === undefined || amount === null || amount === '') return '';
-    const n = Number(amount);
-    const formatted = isNaN(n) ? String(amount) : n.toLocaleString('en-IN');
-    const symbol = currency === 'INR' ? '₹' : (currency === 'USD' ? '$' : currency);
-    return `${symbol}${formatted}`;
-  };
-  
-  const buildCandidateFullBlock = () => {
-    const parts = [
-      candidateName,
-      offerData?.candidateEmail,
-      offerData?.candidateAddress
-    ].filter(Boolean);
-    return parts.join('<br/>');
-  };
-  
-  const buildSalarySection = () => {
-    const salaryFmt = formatSalary(offerData?.salary);
-    return {
-      earningsRows: '',        // optional: generate rows if you have breakdown
-      deductionsRows: '',      // optional: generate rows if you have breakdown
-      totalEarnings: salaryFmt,
-      totalDeductions: '0',
-      netSalary: salaryFmt,
-      annualTakeHome: salaryFmt,
-      salaryInWords: ''        // optional: add number-to-words later
+    
+    // Helpers to format values and fill placeholders
+    const formatDate = (dateStr) => {
+      if (!dateStr) return '';
+      try {
+        return new Date(dateStr).toLocaleDateString('en-IN', { day: 'numeric', month: 'long', year: 'numeric' });
+      } catch {
+        return String(dateStr);
+      }
     };
-  };
-  
-  const fillTemplate = (html, map) =>
-    Object.entries(map).reduce((acc, [k, v]) => acc.replace(new RegExp(`\\{{2}${k}\\}{2}`, 'g'), v ?? ''), html);
-  
-   // Reuse the same helpers here (formatDate, formatSalary, buildCandidateFullBlock, buildSalarySection, fillTemplate)
-
-   const filledHtml = fillTemplate(safeHtml, {
-    candidateFullBlock: (() => {
+    
+    const formatSalary = (amount, currency = (offerData?.currency || 'INR')) => {
+      if (amount === undefined || amount === null || amount === '') return '';
+      const n = Number(amount);
+      const formatted = isNaN(n) ? String(amount) : n.toLocaleString('en-IN');
+      const symbol = currency === 'INR' ? '₹' : (currency === 'USD' ? '$' : currency);
+      return `${symbol}${formatted}`;
+    };
+    
+    const buildCandidateFullBlock = () => {
       const parts = [
-        (offerData?.candidateName || candidateName),
+        candidateName,
         offerData?.candidateEmail,
         offerData?.candidateAddress
       ].filter(Boolean);
       return parts.join('<br/>');
-    })(),
-    startDate: formatDate(offerData?.startDate),
-    interviewDate: formatDate(offerData?.interviewDate),
-    salary: formatSalary(offerData?.salary),
-    termsBlock: '',
-    salaryMatrix: '',
-    ...buildSalarySection()
-  });
+    };
+    
+    const buildSalarySection = () => {
+      const salaryFmt = formatSalary(offerData?.salary);
+      return {
+        earningsRows: '',        // optional: generate rows if you have breakdown
+        deductionsRows: '',      // optional: generate rows if you have breakdown
+        totalEarnings: salaryFmt,
+        totalDeductions: '0',
+        netSalary: salaryFmt,
+        annualTakeHome: salaryFmt,
+        salaryInWords: ''        // optional: add number-to-words later
+      };
+    };
+    
+    const fillTemplate = (html, map) =>
+      Object.entries(map).reduce((acc, [k, v]) => acc.replace(new RegExp(`\\{{2}${k}\\}{2}`, 'g'), v ?? ''), html);
 
-// Use filledHtml for PDF
-const pdfBuffer = await new Promise((resolve, reject) => {
-  htmlToPdf.create(filledHtml, { format: 'A4', border: '10mm' }).toBuffer((err, buffer) => {
-    if (err) return reject(err);
-    resolve(buffer);
-  });
-});
+    // Reuse the same helpers here (formatDate, formatSalary, buildCandidateFullBlock, buildSalarySection, fillTemplate)
+    const filledHtml = fillTemplate(safeHtml, {
+      candidateFullBlock: (() => {
+        const parts = [
+          (offerData?.candidateName || candidateName),
+          offerData?.candidateEmail,
+          offerData?.candidateAddress
+        ].filter(Boolean);
+        return parts.join('<br/>');
+      })(),
+      startDate: formatDate(offerData?.startDate),
+      interviewDate: formatDate(offerData?.interviewDate),
+      salary: formatSalary(offerData?.salary),
+      termsBlock: '',
+      salaryMatrix: '',
+      ...buildSalarySection()
+    });
+
+    // Use filledHtml for PDF
+    const pdfBuffer = await new Promise((resolve, reject) => {
+      htmlToPdf.create(filledHtml, { format: 'A4', border: '10mm' }).toBuffer((err, buffer) => {
+        if (err) return reject(err);
+        resolve(buffer);
+      });
+    });
 
     const fileName = `offer_letter_${(candidateName || 'candidate').replace(/\s+/g, '_')}_${Date.now()}.pdf`;
     const s3Key = `offer-letters/${fileName}`;
-   // After:
-await uploadToS3(pdfBuffer, s3Key, 'application/pdf');
+    
+    // After:
+    await uploadToS3(pdfBuffer, s3Key, 'application/pdf');
 
-// Add this pre-sign block (same style as sendReportToHR):
-const command = new GetObjectCommand({
-  Bucket: process.env.MINIO_BUCKET_NAME,
-  Key: s3Key
-});
-const offerLetterUrl = await getSignedUrl(s3, command, { expiresIn: 604800 }); // 7 days
+    // Add this pre-sign block (same style as sendReportToHR):
+    const command = new GetObjectCommand({
+      Bucket: process.env.MINIO_BUCKET_NAME,
+      Key: s3Key
+    });
+    const offerLetterUrl = await getSignedUrl(s3, command, { expiresIn: 604800 }); // 7 days
 
-  // Import both senders for clarity
-const { sendOfferLetter, sendOfferLetterToHR } = require('./services/interviewService');
+    // Import both senders for clarity
+    const { sendOfferLetter, sendOfferLetterToHR } = require('./services/interviewService');
 
-// Send to Candidate
-await sendOfferLetter({
-  candidateName,
-  candidateEmail: assessment.candidateEmail || offerData?.candidateEmail, // fallback added
-  position: offerData?.position || assessment.jobTitle,
-  salary: offerData?.salary,
-  startDate: offerData?.startDate,
-  companyName: offerData?.companyName || user?.companyName
-}, offerLetterUrl);
+    // Send to Candidate
+    await sendOfferLetter({
+      candidateName,
+      candidateEmail: assessment.candidateEmail || offerData?.candidateEmail, // fallback added
+      position: offerData?.position || assessment.jobTitle,
+      salary: offerData?.salary,
+      startDate: offerData?.startDate,
+      companyName: offerData?.companyName || user?.companyName
+    }, offerLetterUrl);
 
-// Send to HR
-await sendOfferLetterToHR({
-  hrEmail: user.email,
-  companyName: offerData?.companyName || user?.companyName,
-  candidateName,
-  position: offerData?.position || assessment.jobTitle,
-  salary: offerData?.salary,
-  startDate: offerData?.startDate,
-  assessmentScore: assessment.testResult?.combinedScore || 'N/A',
-  interviewRating: 'N/A'
-}, offerLetterUrl);
+    // Send to HR
+    await sendOfferLetterToHR({
+      hrEmail: user.email,
+      companyName: offerData?.companyName || user?.companyName,
+      candidateName,
+      position: offerData?.position || assessment.jobTitle,
+      salary: offerData?.salary,
+      startDate: offerData?.startDate,
+      assessmentScore: assessment.testResult?.combinedScore || 'N/A',
+      interviewRating: 'N/A'
+    }, offerLetterUrl);
 
     return res.json({ success: true, s3Key });
   } catch (error) {
@@ -7937,6 +8667,7 @@ await sendOfferLetterToHR({
     return res.status(500).json({ success: false, error: 'Failed to finalize offer' });
   }
 });
+
 // Generate professional offer letter PDF
 async function generateProfessionalOfferLetter(data) {
   const PDFDocument = require('pdfkit');
@@ -8225,6 +8956,11 @@ app.get('/api/candidate-decisions', authenticateJWT, async (req, res) => {
 });
 
 // ==============================
+
+// Document Collection Routes
+const documentCollectionRoutes = require('./routes/documentCollectionRoutes');
+app.use('/api/document-collection', authenticateJWT, documentCollectionRoutes);
+
 
 // Health check endpoint
 app.get('/health', (req, res) => {
