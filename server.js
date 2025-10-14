@@ -1146,7 +1146,8 @@ app.post('/api/merged-pdf/generate/:sessionId', authenticateJWT, verifyOwnership
       // Generate signed URL for download
       const command = new GetObjectCommand({
         Bucket: process.env.MINIO_BUCKET_NAME,
-        Key: result.s3Key
+        Key: result.s3Key,
+        ResponseContentDisposition: req.query.download ? `attachment; filename="${result.filename}"` : `inline`
       });
       
       const downloadUrl = await getSignedUrl(s3, command, { expiresIn: 3600 }); // 1 hour
@@ -1274,41 +1275,41 @@ app.get('/api/merged-pdf/:mergedDocId', authenticateJWT, async (req, res) => {
 // Bulk download merged PDFs
 app.post('/api/merged-pdf/bulk-download', authenticateJWT, async (req, res) => {
   try {
-    const { mergedDocumentIds, candidates } = req.body;
+    const { assessmentSessionIds, candidates } = req.body;
     
     console.log('🔥 [MERGED PDF BULK] Starting bulk merged PDF download:', {
       userId: req.user.id,
-      documentCount: mergedDocumentIds?.length || 0,
+      sessionCount: assessmentSessionIds?.length || 0,
       candidateCount: candidates?.length || 0,
       timestamp: new Date().toISOString()
     });
 
     // Validate input
-    if (!mergedDocumentIds || !Array.isArray(mergedDocumentIds) || mergedDocumentIds.length === 0) {
+    if (!assessmentSessionIds || !Array.isArray(assessmentSessionIds) || assessmentSessionIds.length === 0) {
       return res.status(400).json({
         success: false,
-        error: 'Invalid or empty merged document IDs provided'
+        error: 'Invalid or empty assessment session IDs provided'
       });
     }
 
-    if (mergedDocumentIds.length > 25) {
+    if (assessmentSessionIds.length > 25) {
       return res.status(400).json({
         success: false,
         error: 'Maximum 25 merged documents can be downloaded at once'
       });
     }
 
-    // Fetch merged documents with ownership verification
+    // Fetch merged documents with ownership verification using assessment session IDs
     const mergedDocs = await MergedDocument.find({
-      _id: { $in: mergedDocumentIds },
+      assessmentSession: { $in: assessmentSessionIds },
       user: req.user.id,
       status: 'completed'
     }).populate('assessmentSession', 'candidateEmail jobTitle completedAt');
 
     console.log('📊 [MERGED PDF BULK] Found merged documents:', {
-      requested: mergedDocumentIds.length,
+      requested: assessmentSessionIds.length,
       found: mergedDocs.length,
-      missing: mergedDocumentIds.length - mergedDocs.length
+      missing: assessmentSessionIds.length - mergedDocs.length
     });
 
     if (mergedDocs.length === 0) {
@@ -1423,7 +1424,7 @@ app.post('/api/merged-pdf/bulk-download', authenticateJWT, async (req, res) => {
     console.log('🎉 [MERGED PDF BULK] Bulk download completed successfully:', {
       successCount,
       failureCount,
-      totalRequested: mergedDocumentIds.length,
+      totalRequested: assessmentSessionIds.length,
       zipSizeMB: (zipBuffer.length / 1024 / 1024).toFixed(2)
     });
 
@@ -1431,7 +1432,7 @@ app.post('/api/merged-pdf/bulk-download', authenticateJWT, async (req, res) => {
       success: true,
       downloadUrl,
       summary: {
-        total: mergedDocumentIds.length,
+        total: assessmentSessionIds.length,
         successful: successCount,
         failed: failureCount,
         zipSizeMB: (zipBuffer.length / 1024 / 1024).toFixed(2)
