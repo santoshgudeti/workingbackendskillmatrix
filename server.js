@@ -2022,37 +2022,60 @@ app.get('/api/recommendations/candidates', authenticateJWT, async (req, res) => 
     };
 
     const sharedResponses = await ApiResponse.find(query)
-      .populate('resumeId', 'title filename')
-      .populate('jobDescriptionId', 'title filename')
+      .populate('resumeId', 'title filename s3Key')
+      .populate('jobDescriptionId', 'title filename s3Key')
       .sort({ createdAt: -1 });
 
     const testScores = await TestResult.find();
     const sessions = await AssessmentSession.find()
-      .populate({
-        path: 'recording',
-        select: 'videoPath screenPath videoAnalysis -_id'
-      })
-      .populate('testResult')
-      .populate({
-        path: 'voiceAnswers',
-        select: 'question audioPath answer -_id'
-      });
+      .populate('recording')
+      .populate('testResult');
 
-    const enrichedResponses = sharedResponses.map(candidate => {
+    const enriched = await Promise.all(sharedResponses.map(async candidate => {
       const email = candidate.matchingResult?.[0]?.["Resume Data"]?.email;
       const testScore = testScores.find(ts => ts.candidateEmail === email);
       const session = sessions.find(s => s.candidateEmail === email);
 
+      // Generate signed URLs for resume and job description if they exist
+      let resumeUrl = null;
+      let jdUrl = null;
+      
+      if (candidate.resumeId && candidate.resumeId.s3Key) {
+        try {
+          const resumeCommand = new GetObjectCommand({
+            Bucket: process.env.MINIO_BUCKET_NAME,
+            Key: candidate.resumeId.s3Key
+          });
+          resumeUrl = await getSignedUrl(s3, resumeCommand, { expiresIn: 900 });
+        } catch (error) {
+          console.error('Error generating resume URL:', error);
+        }
+      }
+      
+      if (candidate.jobDescriptionId && candidate.jobDescriptionId.s3Key) {
+        try {
+          const jdCommand = new GetObjectCommand({
+            Bucket: process.env.MINIO_BUCKET_NAME,
+            Key: candidate.jobDescriptionId.s3Key
+          });
+          jdUrl = await getSignedUrl(s3, jdCommand, { expiresIn: 900 });
+        } catch (error) {
+          console.error('Error generating JD URL:', error);
+        }
+      }
+
       return {
         ...candidate.toObject(),
         testScore: testScore || null,
-        assessmentSession: session || null
+        assessmentSession: session || null,
+        resumeUrl, // Add resume URL
+        jdUrl      // Add job description URL
       };
-    });
+    }));
 
-    res.status(200).json(enrichedResponses);
+    res.status(200).json(enriched);
   } catch (error) {
-    console.error('Error fetching recommended candidates:', error.message);
+    console.error('Error fetching recommended candidates:', error);
     res.status(500).json({ error: 'Failed to fetch recommended candidates.' });
   }
 });
@@ -2061,8 +2084,8 @@ app.get('/api/candidate-filtering', authenticateJWT, async (req, res) => {
   try {
     // Step 1: Fetch base candidate responses
     const responses = await ApiResponse.find({ user: req.user.id })
-      .populate('resumeId', 'title filename')
-      .populate('jobDescriptionId', 'title filename')
+      .populate('resumeId', 'title filename s3Key')
+      .populate('jobDescriptionId', 'title filename s3Key')
       .sort({ createdAt: -1 });
 
     // Step 2: Fetch related test scores and assessment sessions with proper population
@@ -2079,18 +2102,48 @@ app.get('/api/candidate-filtering', authenticateJWT, async (req, res) => {
       });
 
     // Step 3: Enrich responses by matching candidate email
-    const enrichedResponses = responses.map(candidate => {
+    const enrichedResponses = await Promise.all(responses.map(async candidate => {
       const email = candidate.matchingResult?.[0]?.["Resume Data"]?.email;
 
       const testScore = testScores.find(ts => ts.candidateEmail === email);
       const session = sessions.find(s => s.candidateEmail === email);
 
+      // Generate signed URLs for resume and job description if they exist
+      let resumeUrl = null;
+      let jdUrl = null;
+      
+      if (candidate.resumeId && candidate.resumeId.s3Key) {
+        try {
+          const resumeCommand = new GetObjectCommand({
+            Bucket: process.env.MINIO_BUCKET_NAME,
+            Key: candidate.resumeId.s3Key
+          });
+          resumeUrl = await getSignedUrl(s3, resumeCommand, { expiresIn: 900 });
+        } catch (error) {
+          console.error('Error generating resume URL:', error);
+        }
+      }
+      
+      if (candidate.jobDescriptionId && candidate.jobDescriptionId.s3Key) {
+        try {
+          const jdCommand = new GetObjectCommand({
+            Bucket: process.env.MINIO_BUCKET_NAME,
+            Key: candidate.jobDescriptionId.s3Key
+          });
+          jdUrl = await getSignedUrl(s3, jdCommand, { expiresIn: 900 });
+        } catch (error) {
+          console.error('Error generating JD URL:', error);
+        }
+      }
+
       return {
         ...candidate.toObject(),
         testScore: testScore || null,
-        assessmentSession: session || null
+        assessmentSession: session || null,
+        resumeUrl, // Add resume URL
+        jdUrl      // Add job description URL
       };
-    });
+    }));
 
     res.status(200).json(enrichedResponses);
   } catch (error) {
@@ -2107,8 +2160,8 @@ app.get('/api/candidates/segmented', authenticateJWT, async (req, res) => {
 
     // Fetch responses with proper population
     const responses = await ApiResponse.find({ user: req.user.id })
-      .populate('resumeId', 'title filename')
-      .populate('jobDescriptionId', 'title filename')
+      .populate('resumeId', 'title filename s3Key')
+      .populate('jobDescriptionId', 'title filename s3Key')
       .sort({ createdAt: -1 });
 
     const testScores = await TestResult.find();
@@ -2124,17 +2177,47 @@ app.get('/api/candidates/segmented', authenticateJWT, async (req, res) => {
       });
 
     // Enrich all responses first
-    const enrichedResponses = responses.map(candidate => {
+    const enrichedResponses = await Promise.all(responses.map(async candidate => {
       const email = candidate.matchingResult?.[0]?.["Resume Data"]?.email;
       const testScore = testScores.find(ts => ts.candidateEmail === email);
       const session = sessions.find(s => s.candidateEmail === email);
 
+      // Generate signed URLs for resume and job description if they exist
+      let resumeUrl = null;
+      let jdUrl = null;
+      
+      if (candidate.resumeId && candidate.resumeId.s3Key) {
+        try {
+          const resumeCommand = new GetObjectCommand({
+            Bucket: process.env.MINIO_BUCKET_NAME,
+            Key: candidate.resumeId.s3Key
+          });
+          resumeUrl = await getSignedUrl(s3, resumeCommand, { expiresIn: 900 });
+        } catch (error) {
+          console.error('Error generating resume URL:', error);
+        }
+      }
+      
+      if (candidate.jobDescriptionId && candidate.jobDescriptionId.s3Key) {
+        try {
+          const jdCommand = new GetObjectCommand({
+            Bucket: process.env.MINIO_BUCKET_NAME,
+            Key: candidate.jobDescriptionId.s3Key
+          });
+          jdUrl = await getSignedUrl(s3, jdCommand, { expiresIn: 900 });
+        } catch (error) {
+          console.error('Error generating JD URL:', error);
+        }
+      }
+
       return {
         ...candidate.toObject(),
         testScore: testScore || null,
-        assessmentSession: session || null
+        assessmentSession: session || null,
+        resumeUrl, // Add resume URL
+        jdUrl      // Add job description URL
       };
-    });
+    }));
 
     // Segment the enriched responses
     const recent = enrichedResponses.filter(candidate => 
@@ -2490,46 +2573,70 @@ app.post('/api/submit',authenticateJWT,checkSubscription,checkUsageLimits('jdUpl
           continue;
         }
 
-        const formData = new FormData();
-        formData.append('resumes', resume.buffer, resume.originalname);
-        formData.append('job_description', jobDescription.buffer, jobDescription.originalname);
-
+        // Instead of sending form-data, we'll send JSON with signed URLs
         try {
+          // Generate signed URLs for the resume and job description
+          const resumeCommand = new GetObjectCommand({
+            Bucket: process.env.MINIO_BUCKET_NAME,
+            Key: resumeDoc.s3Key
+          });
+          const jdCommand = new GetObjectCommand({
+            Bucket: process.env.MINIO_BUCKET_NAME,
+            Key: jobDescDoc.s3Key
+          });
+          
+          const resumeSignedUrl = await getSignedUrl(s3, resumeCommand, { expiresIn: 900 }); // 15 minutes
+          const jdSignedUrl = await getSignedUrl(s3, jdCommand, { expiresIn: 900 }); // 15 minutes
+
+          // Send JSON payload with signed URLs
           const apiResponse = await axios.post(
             process.env.RESUME_JD_MATCHING,
-            formData,
-            { headers: formData.getHeaders() }
+            {
+              job_description_urls: [jdSignedUrl],
+              resume_urls: [resumeSignedUrl]
+            },
+            {
+              headers: {
+                'Content-Type': 'application/json'
+              }
+            }
           );
 
           if (apiResponse.data && apiResponse.data['POST Response']) {
+            // Enhance the response with resume and JD URLs for frontend access
+            const enhancedResponse = apiResponse.data['POST Response'].map(item => ({
+              ...item,
+              "Resume URL": resumeSignedUrl,
+              "JD URL": jdSignedUrl,
+              "Resume Filename": resumeDoc.filename,
+              "JD Filename": jobDescDoc.filename
+            }));
+
             const savedResponse = new ApiResponse({
-  resumeId: resumeDoc._id,
-  jobDescriptionId: jobDescDoc._id,
-  matchingResult: apiResponse.data['POST Response'],
-  hash: `${resumeHash}-${jdHash}`,
-  user: req.user.id
-});
-await savedResponse.save();  // <-- Candidate consent is default false
+              resumeId: resumeDoc._id,
+              jobDescriptionId: jobDescDoc._id,
+              matchingResult: enhancedResponse,
+              hash: `${resumeHash}-${jdHash}`,
+              user: req.user.id
+            });
+            await savedResponse.save();
 
-// ✅ SEND CANDIDATE EMAIL HERE (with link to give consent)
-const extractedEmail = apiResponse.data['POST Response']?.[0]?.["Resume Data"]?.email;
+            // ✅ SEND CANDIDATE EMAIL HERE (with link to give consent)
+            const extractedEmail = enhancedResponse?.[0]?.["Resume Data"]?.email;
 
-if (extractedEmail) {
-  await sendConsentEmail(extractedEmail, savedResponse._id);
-  console.log(`📨 Sending consent email to: ${extractedEmail}`);
+            if (extractedEmail) {
+              await sendConsentEmail(extractedEmail, savedResponse._id);
+              console.log(`📨 Sending consent email to: ${extractedEmail}`);
+            } else {
+              console.warn(`⚠️ No email found in API response for ${resume.originalname}`);
+            }
 
-} else {
-  console.warn(`⚠️ No email found in API response for ${resume.originalname}`);
-}
-
-
-emitApiResponseUpdate(savedResponse);
-
+            emitApiResponseUpdate(savedResponse);
 
             results.push({
               resumeId: resumeDoc._id,
               jobDescriptionId: jobDescDoc._id,
-              matchingResult: apiResponse.data['POST Response'],
+              matchingResult: enhancedResponse,
             });
           }
         } catch (error) {
@@ -2537,7 +2644,7 @@ emitApiResponseUpdate(savedResponse);
         }
       }
     }
-// Update usage
+// Update usage - now tracking multiple JD uploads
       await User.findByIdAndUpdate(req.user.id, {
         $inc: {
           'usage.jdUploads': files.job_description.length,
@@ -3925,39 +4032,25 @@ app.post('/api/generate-questions', async (req, res) => {
     }
 
     // Original flow for immediate tests (with resume-JD matching)
-    // Get readable streams directly from S3
-    const [resumeStream, jdStream] = await Promise.all([
-      getS3ReadStream(resume.s3Key),
-      getS3ReadStream(jd.s3Key)
+    // Generate signed URLs for both files
+    const [resumeUrl, jdUrl] = await Promise.all([
+      getSignedUrlForS3(resume.s3Key),
+      getSignedUrlForS3(jd.s3Key)
     ]);
 
-    // Create form data with direct S3 streams
-    const form = new FormData();
-    form.append('resumes', resumeStream.stream, {
-      filename: resume.filename || 'resume.pdf',
-      contentType: 'application/pdf',
-      knownLength: resumeStream.contentLength
-    });
-    form.append('job_description', jdStream.stream, {
-      filename: jd.filename || 'job_description.pdf',
-      contentType: 'application/pdf',
-      knownLength: jdStream.contentLength
-    });
-
-    console.log('Streaming files directly from S3 to question generation API...');
-    
-    // Get headers with synchronous length since we have knownLength
-    const headers = {
-      ...form.getHeaders(),
-      'Content-Length': form.getLengthSync()
+    // Send URLs as JSON payload instead of streaming files
+    const payload = {
+      job_description_url: [jdUrl],
+      resume_url: [resumeUrl]
     };
 
-    // Call question generation API with proper headers
-    const response = await axios.post(process.env.MCQ_GENERATION_API, form, {
-      headers,
-      maxContentLength: Infinity,
-      maxBodyLength: Infinity,
+    console.log('Sending signed URLs to question generation API...');
     
+    // Call question generation API with JSON payload
+    const response = await axios.post(process.env.MCQ_GENERATION_API, payload, {
+      headers: {
+        'Content-Type': 'application/json'
+      }
     });
 
     // Parse the API response correctly
