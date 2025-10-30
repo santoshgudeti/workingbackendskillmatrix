@@ -462,6 +462,44 @@ const CandidateDecisionSchema = new mongoose.Schema({
 
 const CandidateDecision = mongoose.model('CandidateDecision', CandidateDecisionSchema);
 
+// ==============================
+// ✅ NEW SCHEMAS
+// ==============================
+const jobPosterSchema = new mongoose.Schema({
+  name: String,
+  email: { type: String, required: true, unique: true },
+  password: { type: String, required: true },
+  isVerified: { type: Boolean, default: false },
+}, { timestamps: true });
+const jobPostSchema = new mongoose.Schema({
+  title: String,
+  companyName: String, // NEW FIELD ADDED
+  location: String,
+  experience: String,
+  jobType: String,
+  department: String,
+  skillsRequired: [String],
+  salaryRange: String,
+  jobDescriptionFile: String,
+  descriptionText: String,
+  publicId: { type: String, unique: true },
+  applications: [{ type: mongoose.Schema.Types.ObjectId, ref: 'Application' }],
+  createdAt: { type: Date, default: Date.now },
+  postedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'JobPoster' },
+});
+
+const JobPoster = mongoose.model('JobPoster', jobPosterSchema);
+const JobPost = mongoose.model('JobPost', jobPostSchema);
+const applicationSchema = new mongoose.Schema({
+  jobId: { type: mongoose.Schema.Types.ObjectId, ref: 'JobPost', required: true },
+  candidateName: { type: String, required: true },
+  candidateEmail: { type: String, required: true },
+  candidatePhone: String,
+  resumeFile: String, // S3 key
+  appliedAt: { type: Date, default: Date.now }
+});
+
+const Application = mongoose.model('Application', applicationSchema);
 
 
 
@@ -2422,6 +2460,195 @@ const getTrialLimit = (type) => {
   };
   return trialLimits[type] || 0;
 };
+
+// 🔥 NEW: JD Validation Endpoint
+app.post('/api/validate-jd', authenticateJWT, upload.single('job_description'), async (req, res) => {
+  try {
+    console.log('📥 JD Validation Request Received:', {
+      userId: req.user?.id,
+      timestamp: new Date().toISOString(),
+      hasFile: !!req.file,
+      fileName: req.file?.originalname,
+      fileSize: req.file?.size,
+      mimeType: req.file?.mimetype
+    });
+
+    // Check if file is provided
+    if (!req.file) {
+      console.log('❌ JD Validation Failed: No file provided');
+      return res.status(400).json({ 
+        success: false, 
+        error: 'Job description file is required.' 
+      });
+    }
+
+    // Check file type (should be PDF)
+    if (req.file.mimetype !== 'application/pdf') {
+      console.log('❌ JD Validation Failed: Invalid file type', {
+        receivedType: req.file.mimetype,
+        expectedType: 'application/pdf'
+      });
+      return res.status(400).json({ 
+        success: false, 
+        error: 'Only PDF files are allowed for job descriptions.' 
+      });
+    }
+
+    // Check file size (25MB limit)
+    if (req.file.size > 25 * 1024 * 1024) {
+      console.log('❌ JD Validation Failed: File too large', {
+        fileSize: req.file.size,
+        maxSize: 25 * 1024 * 1024
+      });
+      return res.status(400).json({ 
+        success: false, 
+        error: 'File size should be less than 25MB.' 
+      });
+    }
+
+    // Log environment variable
+    console.log('🔧 Environment Variables Check:', {
+      jdValidatorUrl: process.env.JD_VALIDATOR,
+      hasJdValidator: !!process.env.JD_VALIDATOR
+    });
+
+    if (!process.env.JD_VALIDATOR) {
+      console.log('❌ JD_VALIDATOR environment variable not set');
+      return res.status(500).json({
+        success: false,
+        error: 'JD validation service not configured'
+      });
+    }
+
+    console.log('🔄 Calling JD Validator API:', {
+      apiUrl: process.env.JD_VALIDATOR,
+      fileName: req.file.originalname,
+      fileSize: req.file.size,
+      mimeType: req.file.mimetype
+    });
+
+    // Call JD Validator API
+    const formData = new FormData();
+    formData.append('job_description', req.file.buffer, {
+      filename: req.file.originalname,
+      contentType: req.file.mimetype
+    });
+    
+    console.log('📦 FormData prepared with job description file');
+
+    console.log('📤 Sending request to JD_VALIDATOR API...');
+    
+    const validatorResponse = await axios.post(
+      process.env.JD_VALIDATOR,
+      formData,
+      { headers: formData.getHeaders() }
+    );
+
+    console.log('📥 Received response from JD_VALIDATOR API:', {
+      status: validatorResponse.status,
+      statusText: validatorResponse.statusText,
+      hasData: !!validatorResponse.data,
+      dataKeys: validatorResponse.data ? Object.keys(validatorResponse.data) : [],
+      // Fixed: Access the correct nested structure with proper null checks
+      isValid: validatorResponse.data?.data?.validation?.isValid,
+      suitabilityScore: validatorResponse.data?.data?.validation?.suitabilityScore,
+      fullDataStructure: process.env.NODE_ENV === 'development' ? validatorResponse.data : 'hidden in production'
+    });
+
+    // Check if the response has the expected structure
+    console.log('🔍 Checking response structure:', {
+      hasData: !!validatorResponse.data,
+      hasSuccess: validatorResponse.data?.success,
+      hasNestedData: !!(validatorResponse.data && validatorResponse.data.data),
+      nestedDataKeys: (validatorResponse.data && validatorResponse.data.data) ? Object.keys(validatorResponse.data.data) : [],
+      fullResponse: process.env.NODE_ENV === 'development' ? validatorResponse.data : 'hidden in production'
+    });
+    
+    if (!validatorResponse.data) {
+      console.log('❌ JD_VALIDATOR API returned no data');
+      return res.status(500).json({
+        success: false,
+        error: 'No data received from JD validation service'
+      });
+    }
+    
+    if (!validatorResponse.data.success) {
+      console.log('❌ JD_VALIDATOR API returned error:', validatorResponse.data);
+      return res.status(500).json({
+        success: false,
+        error: 'Invalid response from JD validation service',
+        details: validatorResponse.data
+      });
+    }
+    
+    if (!validatorResponse.data.data) {
+      console.log('❌ JD_VALIDATOR API returned no validation data:', validatorResponse.data);
+      return res.status(500).json({
+        success: false,
+        error: 'No validation data received from JD validation service',
+        details: validatorResponse.data
+      });
+    }
+
+    // Return validation result with the correct structure
+    const responsePayload = {
+      success: true,
+      data: validatorResponse.data.data // Extract the actual data object
+    };
+    
+    console.log('✅ JD Validation Successful, sending response:', {
+      isValid: responsePayload.data?.validation?.isValid,
+      suitabilityScore: responsePayload.data?.validation?.suitabilityScore,
+      hasValidation: !!(responsePayload.data && responsePayload.data.validation),
+      validationKeys: (responsePayload.data && responsePayload.data.validation) ? Object.keys(responsePayload.data.validation) : []
+    });
+    
+    res.status(200).json(responsePayload);
+  } catch (error) {
+    console.error('❌ JD Validation Error:', {
+      message: error.message,
+      stack: error.stack,
+      code: error.code,
+      responseStatus: error.response?.status,
+      responseStatusText: error.response?.statusText,
+      responseData: error.response?.data
+    });
+    
+    // Handle specific error cases
+    if (error.response) {
+      // The request was made and the server responded with a status code
+      console.log('📡 Error response from JD_VALIDATOR API:', {
+        status: error.response.status,
+        statusText: error.response.statusText,
+        data: error.response.data
+      });
+      
+      return res.status(error.response.status).json({
+        success: false,
+        error: error.response.data?.error || 'JD validation failed',
+        details: process.env.NODE_ENV === 'development' ? error.response.data : undefined
+      });
+    } else if (error.request) {
+      // The request was made but no response was received
+      console.log('⏰ No response received from JD_VALIDATOR API');
+      
+      return res.status(500).json({
+        success: false,
+        error: 'No response from JD validation service'
+      });
+    } else {
+      // Something happened in setting up the request
+      console.log('🔧 Error setting up request to JD_VALIDATOR API');
+      
+      return res.status(500).json({
+        success: false,
+        error: 'Failed to validate job description',
+        details: process.env.NODE_ENV === 'development' ? error.message : undefined
+      });
+    }
+  }
+});
+
 app.post('/api/submit',authenticateJWT,checkSubscription,checkUsageLimits('jdUploads'),checkUsageLimits('resumeUploads'), upload.fields([{ name: 'resumes' }, { name: 'job_description' }]), async (req, res) => {
   let duplicateCount = 0;
   try {
