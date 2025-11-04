@@ -4343,6 +4343,235 @@ app.post('/api/generate-voice-questions', async (req, res) => {
   }
 });
 
+// Add this new endpoint after the existing question generation endpoints
+app.post('/api/create-custom-assessment', authenticateJWT, async (req, res) => {
+  try {
+    const { 
+      candidateEmail, 
+      jobTitle, 
+      resumeId, 
+      jobDescriptionId,
+      customMcqQuestions,
+      customVoiceQuestions
+    } = req.body;
+    
+    // Validate input
+    if (!candidateEmail || !jobTitle || !resumeId || !jobDescriptionId) {
+      return res.status(400).json({ 
+        success: false,
+        error: 'All required fields must be provided' 
+      });
+    }
+    
+    // Validate email format
+    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+    if (!emailRegex.test(candidateEmail)) {
+      return res.status(400).json({ 
+        success: false,
+        error: 'Invalid email format' 
+      });
+    }
+    
+    // Validate custom MCQ questions format
+    if (!customMcqQuestions || !Array.isArray(customMcqQuestions)) {
+      return res.status(400).json({ 
+        success: false,
+        error: 'Custom MCQ questions array is required' 
+      });
+    }
+    
+    // Validate exactly 10 MCQ questions
+    if (customMcqQuestions.length !== 10) {
+      return res.status(400).json({ 
+        success: false,
+        error: 'Exactly 10 MCQ questions are required' 
+      });
+    }
+    
+    // Validate each MCQ question
+    for (let i = 0; i < customMcqQuestions.length; i++) {
+      const q = customMcqQuestions[i];
+      if (!q.question || !q.options || !Array.isArray(q.options) || q.options.length !== 4 || !q.correctAnswer) {
+        return res.status(400).json({ 
+          success: false,
+          error: `Invalid MCQ question format at index ${i}. Each MCQ must have exactly 4 options.` 
+        });
+      }
+    }
+    
+    // Validate custom voice questions format
+    if (!customVoiceQuestions || !Array.isArray(customVoiceQuestions)) {
+      return res.status(400).json({ 
+        success: false,
+        error: 'Custom voice questions array is required' 
+      });
+    }
+    
+    // Validate exactly 5 voice questions
+    if (customVoiceQuestions.length !== 5) {
+      return res.status(400).json({ 
+        success: false,
+        error: 'Exactly 5 voice questions are required' 
+      });
+    }
+    
+    // Validate each voice question
+    for (let i = 0; i < customVoiceQuestions.length; i++) {
+      const q = customVoiceQuestions[i];
+      if (!q.question) {
+        return res.status(400).json({ 
+          success: false,
+          error: `Invalid voice question format at index ${i}` 
+        });
+      }
+    }
+    
+    // Verify resume and JD exist
+    const [resume, jd] = await Promise.all([
+      Resume.findById(resumeId),
+      JobDescription.findById(jobDescriptionId)
+    ]);
+
+    if (!resume || !resume.s3Key) {
+      return res.status(404).json({ error: 'Resume not found in S3' });
+    }
+    if (!jd || !jd.s3Key) {
+      return res.status(404).json({ error: 'Job description not found in S3' });
+    }
+    
+    // Transform custom MCQ questions to match our format
+    const formattedMcqQuestions = customMcqQuestions.map((q, index) => ({
+      id: `cq-${index}-${Date.now()}`,
+      question: q.question,
+      options: q.options,
+      correctAnswer: q.correctAnswer
+    }));
+    
+    // Transform custom voice questions to match our format
+    const formattedVoiceQuestions = customVoiceQuestions.map((q, index) => ({
+      id: `cv-${index}-${Date.now()}`,
+      question: q.question
+    }));
+    
+    // Create session with custom questions
+    const token = require('crypto').randomBytes(20).toString('hex');
+    const testLink = `${process.env.FRONTEND_URL}/assessment/${token}`;
+    
+    const session = new AssessmentSession({
+      user: req.user.id,
+      candidateEmail,
+      jobTitle,
+      testLink,
+      status: 'pending',
+      questions: formattedMcqQuestions,
+      voiceQuestions: formattedVoiceQuestions,
+      resumeId,
+      jobDescriptionId
+    });
+    await session.save();
+    
+    // Increment assessment count
+    await User.findByIdAndUpdate(req.user.id, {
+      $inc: { 'usage.assessments': 1 }
+    });
+    
+    // Email options
+    const mailOptions = {
+      from: `"Assessment System" <${process.env.EMAIL_USER}>`,
+      to: candidateEmail,
+      subject: `Your Custom Assessment for ${jobTitle}`,
+      text: `Please complete your custom assessment at: ${testLink}`,
+      html: `
+        <!DOCTYPE html>
+        <html>
+        <head>
+          <style>
+            body { font-family: Arial, sans-serif; line-height: 1.6; }
+            .container { max-width: 600px; margin: 0 auto; padding: 20px; }
+            .header { background-color: #f8f9fa; padding: 20px; text-align: center; }
+            .content { padding: 20px; }
+            .button { 
+              display: inline-block; 
+              padding: 10px 20px; 
+              background-color: #007bff; 
+              color: white !important; 
+              text-decoration: none; 
+              border-radius: 5px; 
+              margin: 20px 0;
+            }
+            .footer { margin-top: 20px; font-size: 12px; color: #6c757d; }
+          </style>
+        </head>
+        <body>
+          <div class="container">
+            <div class="header">
+              <h2>Custom Assessment Invitation</h2>
+            </div>
+            <div class="content">
+              <p>Hello,</p>
+              <p>You've been invited to complete a custom assessment for the position of <strong>${jobTitle}</strong>.</p>
+              
+              <a href="${testLink}" class="button">Start Custom Assessment</a>
+              
+              <p>Or copy and paste this link into your browser:</p>
+              <p><code>${testLink}</code></p>
+              
+              <p><strong>Note:</strong> This custom assessment includes:</p>
+              <ul>
+                <li>${formattedMcqQuestions.length} Multiple Choice Questions</li>
+                <li>${formattedVoiceQuestions.length} Voice Interview Questions</li>
+                <li>System verification</li>
+                <li>Video interview recording</li>
+              </ul>
+              <p>Your screen and camera will be recorded during the assessment.</p>
+              
+              <p>This link will expire in 24 hours.</p>
+            </div>
+            <div class="footer">
+              <p>If you didn't request this assessment, please ignore this email.</p>
+            </div>
+          </div>
+        </body>
+        </html>
+      `
+    };
+    
+    // Send email
+    try {
+      await transporter.sendMail(mailOptions);
+      console.log(`Custom assessment email sent to ${candidateEmail}`);
+      
+      res.status(200).json({ 
+        success: true,
+        message: 'Custom assessment created and email sent successfully!', 
+        sessionId: session._id,
+        testLink
+      });
+    } catch (emailError) {
+      console.error('Email sending failed:', emailError);
+      
+      // Delete the session if email fails
+      await AssessmentSession.findByIdAndDelete(session._id);
+      await User.findByIdAndUpdate(req.user.id, {
+        $inc: { 'usage.assessments': -1 }
+      });
+      
+      res.status(500).json({ 
+        success: false,
+        error: 'Failed to send assessment email',
+        details: process.env.NODE_ENV === 'development' ? emailError.message : undefined
+      });
+    }
+  } catch (error) {
+    console.error('Error in create-custom-assessment:', error);
+    res.status(500).json({ 
+      success: false,
+      error: 'Failed to create custom assessment',
+      details: process.env.NODE_ENV === 'development' ? error.message : undefined
+    });
+  }
+});
+
 
 // Test link generator //
 // Updated send-test-link endpoint with NodeMailer
