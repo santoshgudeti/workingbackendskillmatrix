@@ -50,6 +50,7 @@
     "path": "^0.12.7",
     "pdf-lib": "^1.17.1",
     "pdfkit": "^0.15.2",
+    "puppeteer": "^24.30.0",
     "react-rnd": "^10.5.2",
     "react-router-dom": "^7.0.0",
     "react-toastify": "^11.0.2",

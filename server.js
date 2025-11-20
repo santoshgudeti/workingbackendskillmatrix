@@ -38,6 +38,9 @@ const htmlToPdf = require('html-pdf');
 const sendConsentEmail = require('./services/sendConsentMail'); // Or wherever you place it
 const { handleAutomaticJobPosting } = require('./services/externalJobPostingService');
 const { MergedDocument, generateMergedPDF, getMergedDocuments } = require('./services/mergedPDFService');
+const letterheadService = require('./services/letterheadService');
+const industrialOfferLetterService = require('./services/industrialOfferLetterService');
+const Letterhead = require('./models/Letterhead');
 
 dotenv.config();
 // Initialize Express app
@@ -8536,17 +8539,15 @@ app.post('/api/candidates/select', authenticateJWT, async (req, res) => {
     };
     
     // Generate PDF either from provided HTML (preferred) or from professional template
+    // Use the new PDF generation with letterhead merging
+    const { generatePDFFromHTMLWithLetterhead } = require('./services/offerLetterService');
     let pdfBuffer;
     if (offerHtml && offerHtml.trim()) {
-      // Use html-pdf (already installed) to render HTML to PDF
-      pdfBuffer = await new Promise((resolve, reject) => {
-        htmlToPdf.create(offerHtml, { format: 'A4', border: '10mm' }).toBuffer((err, buffer) => {
-          if (err) return reject(err);
-          resolve(buffer);
-        });
-      });
+      pdfBuffer = await generatePDFFromHTMLWithLetterhead(offerHtml, req.user.id);
     } else {
-      pdfBuffer = await generateProfessionalOfferLetter({
+      // Generate from template and then merge with letterhead
+      const { generateProfessionalTemplate } = require('./services/offerLetterService');
+      const templateHtml = generateProfessionalTemplate({
         candidateName: candidate.name,
         candidateEmail: candidate.email,
         position: offerData.position || assessment.jobTitle,
@@ -8560,6 +8561,7 @@ app.post('/api/candidates/select', authenticateJWT, async (req, res) => {
         assessmentScore: assessment.testResult?.combinedScore || 'N/A',
         interviewRating: interviewFeedback?.rating || 'N/A'
       });
+      pdfBuffer = await generatePDFFromHTMLWithLetterhead(templateHtml, req.user.id);
     }
 
     // Upload the resulting PDF to S3
@@ -8691,18 +8693,60 @@ app.post('/api/offers/draft', authenticateJWT, async (req, res) => {
       return res.status(400).json({ success: false, error: 'Invalid template' });
     }
 
+    // Pass all offerData fields to the template
     const offerHtml = offerTemplate({
+      // Basic template fields
       candidateName,
       jobTitle,
       companyName,
       today,
-      position: offerData.position,
-      salary: offerData.salary,
-      startDate: offerData.startDate,
-      benefits: offerData.benefits,
-      notes: offerData.notes,
-      hrName: user.fullName,
-      hrEmail: user.email
+      
+      // Candidate Details
+      candidateEmail: offerData?.candidateEmail || assessment.candidateEmail || '',
+      candidateAddress: offerData?.candidateAddress || '',
+      candidatePhone: offerData?.candidatePhone || '',
+      
+      // Position Details
+      position: offerData?.position || jobTitle,
+      department: offerData?.department || '',
+      employmentType: offerData?.employmentType || 'Full-time',
+      reportingManager: offerData?.reportingManager || '',
+      workLocation: offerData?.workLocation || 'Office',
+      
+      // Salary & Benefits
+      salary: offerData?.salary || '',
+      currency: offerData?.currency || 'INR',
+      salaryFrequency: offerData?.salaryFrequency || 'per annum',
+      benefits: offerData?.benefits || '',
+      
+      // Dates & Terms
+      startDate: offerData?.startDate || '',
+      endDate: offerData?.endDate || '',
+      probationPeriod: offerData?.probationPeriod || '3 months',
+      noticePeriod: offerData?.noticePeriod || '30 days',
+      workingHours: offerData?.workingHours || '9 AM to 6 PM',
+      workingDays: offerData?.workingDays || 'Monday to Friday',
+      
+      // Company Details
+      companyAddress: offerData?.companyAddress || '',
+      companyPhone: offerData?.companyPhone || '',
+      companyEmail: offerData?.companyEmail || user?.email || '',
+      companyWebsite: offerData?.companyWebsite || '',
+      
+      // HR Details
+      hrName: offerData?.hrName || user?.fullName || '',
+      hrTitle: offerData?.hrTitle || 'HR Manager',
+      hrEmail: offerData?.hrEmail || user?.email || '',
+      hrPhone: offerData?.hrPhone || '',
+      
+      // Additional Terms
+      additionalTerms: offerData?.additionalTerms || '',
+      specialConditions: offerData?.specialConditions || '',
+      notes: offerData?.notes || '',
+      
+      // Interview Details
+      interviewDate: offerData?.interviewDate || '',
+      interviewFeedback: offerData?.interviewFeedback || ''
     });
 
     res.status(200).json({
@@ -8906,6 +8950,54 @@ app.delete('/api/document-collection/templates/:templateId', authenticateJWT, as
   }
 });
 
+// Schedule periodic cleanup of old letterheads (once per day)
+setInterval(async () => {
+  try {
+    console.log('🕒 [SCHEDULED TASK] Running periodic letterhead cleanup');
+    
+    // Get all companies with letterheads
+    const companies = await User.find({}, '_id');
+    
+    let totalDeleted = 0;
+    for (const company of companies) {
+      try {
+        const { cleanupOldLetterheads } = require('./services/letterheadService');
+        const result = await cleanupOldLetterheads(company._id, 30); // Cleanup letterheads older than 30 days
+        totalDeleted += result.deleted;
+      } catch (companyError) {
+        console.error(`❌ [SCHEDULED TASK] Error cleaning up letterheads for company ${company._id}:`, companyError);
+      }
+    }
+    
+    console.log('✅ [SCHEDULED TASK] Letterhead cleanup completed:', { totalDeleted });
+  } catch (error) {
+    console.error('❌ [SCHEDULED TASK] Error in periodic letterhead cleanup:', error);
+  }
+}, 24 * 60 * 60 * 1000); // Run once per day
+
+// Cleanup old letterheads endpoint
+app.post('/api/letterhead/cleanup', authenticateJWT, async (req, res) => {
+  try {
+    const { daysOld } = req.body || {};
+    const days = daysOld && Number.isInteger(daysOld) ? daysOld : 30;
+    
+    const { cleanupOldLetterheads } = require('./services/letterheadService');
+    const result = await cleanupOldLetterheads(req.user.id, days);
+    
+    res.status(200).json({
+      success: true,
+      message: `Cleanup completed. ${result.deleted} old letterheads removed.`,
+      data: result
+    });
+  } catch (error) {
+    console.error('Error cleaning up letterheads:', error);
+    res.status(500).json({
+      success: false,
+      error: error.message || 'Failed to cleanup letterheads'
+    });
+  }
+});
+
 // Endpoint to upload documents
 app.post('/api/candidates/:candidateId/upload-documents', authenticateJWT, upload.array('documents'), async (req, res) => {
   try {
@@ -8989,8 +9081,265 @@ app.get('/api/candidates/:candidateId/document-collection/:documentCollectionId'
   }
 });
 
+// Letterhead upload endpoint
+app.post('/api/letterhead/upload', authenticateJWT, letterheadService.getUploadMiddleware(), async (req, res) => {
+  try {
+    if (!req.file) {
+      return res.status(400).json({
+        success: false,
+        error: 'No letterhead file uploaded'
+      });
+    }
 
+    const letterhead = await letterheadService.uploadLetterhead(req.file, req.user.id);
+          
+    res.status(200).json({
+      success: true,
+      message: 'Letterhead uploaded successfully',
+      data: {
+        ...letterhead,
+        id: letterhead._id || letterhead.id
+      }
+    });
+  } catch (error) {
+    console.error('Error uploading letterhead:', error);
+    res.status(500).json({
+      success: false,
+      error: error.message || 'Failed to upload letterhead'
+    });
+  }
+});
 
+// Get active letterhead for company
+app.get('/api/letterhead/active', authenticateJWT, async (req, res) => {
+  try {
+    const letterhead = await letterheadService.getActiveLetterhead(req.user.id);
+    
+    if (!letterhead) {
+      return res.status(404).json({
+        success: false,
+        error: 'No active letterhead found'
+      });
+    }
+    
+    res.status(200).json({
+      success: true,
+      data: letterhead
+    });
+  } catch (error) {
+    console.error('Error getting active letterhead:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Failed to get active letterhead'
+    });
+  }
+});
+
+// Generate letterhead preview URL
+app.get('/api/letterhead/preview/:letterheadId', authenticateJWT, async (req, res) => {
+  try {
+    const { letterheadId } = req.params;
+    
+    // First try to find by _id
+    let letterhead = await Letterhead.findOne({
+      _id: letterheadId,
+      companyId: req.user.id
+    });
+    
+    // If not found by _id, try to find by s3Key (for preview functionality)
+    if (!letterhead) {
+      letterhead = await Letterhead.findOne({
+        s3Key: letterheadId,
+        companyId: req.user.id
+      });
+    }
+    
+    if (!letterhead) {
+      return res.status(404).json({
+        success: false,
+        error: 'Letterhead not found'
+      });
+    }
+    
+    const previewUrl = await letterheadService.generatePreviewUrl(letterhead.s3Key);
+    
+    res.status(200).json({
+      success: true,
+      url: previewUrl,
+      data: {
+        id: letterhead._id,
+        s3Key: letterhead.s3Key,
+        originalName: letterhead.originalName,
+        uploadedAt: letterhead.uploadedAt
+      }
+    });
+  } catch (error) {
+    console.error('Error generating letterhead preview:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Failed to generate letterhead preview'
+    });
+  }
+});
+
+// ==============================
+// INDUSTRIAL-GRADE OFFER LETTER ENDPOINTS
+// ==============================
+
+// Generate industrial-grade offer letter with letterhead merging
+app.post('/api/industrial-offers/generate', authenticateJWT, async (req, res) => {
+  try {
+    const { offerData } = req.body;
+    
+    if (!offerData) {
+      return res.status(400).json({
+        success: false,
+        error: 'offerData is required'
+      });
+    }
+    
+    // Validate required fields
+    if (!offerData.candidateName || !offerData.candidateEmail || !offerData.position) {
+      return res.status(400).json({
+        success: false,
+        error: 'candidateName, candidateEmail, and position are required'
+      });
+    }
+    
+    const result = await industrialOfferLetterService.generateOfferLetter(offerData, req.user.id);
+    
+    res.status(200).json({
+      success: true,
+      data: result
+    });
+    
+  } catch (error) {
+    console.error('Error generating industrial offer letter:', error);
+    res.status(500).json({
+      success: false,
+      error: error.message || 'Failed to generate offer letter'
+    });
+  }
+});
+
+// Get offer letter details
+app.get('/api/industrial-offers/:offerLetterId', authenticateJWT, async (req, res) => {
+  try {
+    const { offerLetterId } = req.params;
+    
+    const offerLetter = await industrialOfferLetterService.getOfferLetter(offerLetterId, req.user.id);
+    
+    res.status(200).json({
+      success: true,
+      data: offerLetter
+    });
+    
+  } catch (error) {
+    console.error('Error retrieving offer letter:', error);
+    res.status(500).json({
+      success: false,
+      error: error.message || 'Failed to retrieve offer letter'
+    });
+  }
+});
+
+// Get all offer letters for company with pagination
+app.get('/api/industrial-offers', authenticateJWT, async (req, res) => {
+  try {
+    const { page, limit, status } = req.query;
+    
+    const result = await industrialOfferLetterService.getOfferLetters(req.user.id, {
+      page: parseInt(page) || 1,
+      limit: parseInt(limit) || 20,
+      status
+    });
+    
+    res.status(200).json({
+      success: true,
+      data: result
+    });
+    
+  } catch (error) {
+    console.error('Error retrieving offer letters:', error);
+    res.status(500).json({
+      success: false,
+      error: error.message || 'Failed to retrieve offer letters'
+    });
+  }
+});
+
+// Generate download URL for offer letter
+app.get('/api/industrial-offers/:offerLetterId/download-url', authenticateJWT, async (req, res) => {
+  try {
+    const { offerLetterId } = req.params;
+    
+    // Verify the offer letter belongs to the user's company
+    const offerLetter = await industrialOfferLetterService.getOfferLetter(offerLetterId, req.user.id);
+    
+    const downloadUrl = await industrialOfferLetterService.generateDownloadUrl(offerLetter.s3Key);
+    
+    res.status(200).json({
+      success: true,
+      url: downloadUrl
+    });
+    
+  } catch (error) {
+    console.error('Error generating download URL:', error);
+    res.status(500).json({
+      success: false,
+      error: error.message || 'Failed to generate download URL'
+    });
+  }
+});
+
+// Update offer letter status
+app.patch('/api/industrial-offers/:offerLetterId', authenticateJWT, async (req, res) => {
+  try {
+    const { offerLetterId } = req.params;
+    const { updateData } = req.body;
+    
+    const updatedOfferLetter = await industrialOfferLetterService.updateOfferLetter(
+      offerLetterId, 
+      req.user.id, 
+      updateData
+    );
+    
+    res.status(200).json({
+      success: true,
+      data: updatedOfferLetter
+    });
+    
+  } catch (error) {
+    console.error('Error updating offer letter:', error);
+    res.status(500).json({
+      success: false,
+      error: error.message || 'Failed to update offer letter'
+    });
+  }
+});
+
+// Delete offer letter (soft delete)
+app.delete('/api/industrial-offers/:offerLetterId', authenticateJWT, async (req, res) => {
+  try {
+    const { offerLetterId } = req.params;
+    
+    await industrialOfferLetterService.deleteOfferLetter(offerLetterId, req.user.id);
+    
+    res.status(200).json({
+      success: true,
+      message: 'Offer letter deleted successfully'
+    });
+    
+  } catch (error) {
+    console.error('Error deleting offer letter:', error);
+    res.status(500).json({
+      success: false,
+      error: error.message || 'Failed to delete offer letter'
+    });
+  }
+});
+
+// ==============================
 
 // Finalize edited HTML -> PDF + email (optional alternative to /api/candidates/select)
 app.post('/api/offers/finalize', authenticateJWT, async (req, res) => {
@@ -9125,108 +9474,40 @@ app.post('/api/offers/finalize', authenticateJWT, async (req, res) => {
   }
 });
 
-// Generate professional offer letter PDF
-async function generateProfessionalOfferLetter(data) {
-  const PDFDocument = require('pdfkit');
-  const doc = new PDFDocument({ margin: 50 });
-  const buffers = [];
-  
-  doc.on('data', buffers.push.bind(buffers));
-  
-  // Header
-  doc.fontSize(24)
-     .font('Helvetica-Bold')
-     .text('OFFER OF EMPLOYMENT', { align: 'center' });
-  
-  doc.moveDown(2);
-  
-  // Date
-  doc.fontSize(12)
-     .font('Helvetica')
-     .text(`Date: ${new Date().toLocaleDateString()}`, { align: 'right' });
-  
-  doc.moveDown(1);
-  
-  // Candidate details
-  doc.fontSize(12)
-     .text(`Dear ${data.candidateName},`, { align: 'left' });
-  
-  doc.moveDown(1);
-  
-  // Offer content
-  doc.fontSize(12)
-     .text(`We are pleased to extend an offer of employment for the position of ${data.position} at ${data.companyName}. After careful consideration of your qualifications and performance during the interview process, we believe you would be a valuable addition to our team.`, { align: 'justify' });
-  
-  doc.moveDown(1);
-  
-  // Position details
-  doc.fontSize(14)
-     .font('Helvetica-Bold')
-     .text('Position Details:', { align: 'left' });
-  
-  doc.moveDown(0.5);
-  doc.fontSize(12)
-     .font('Helvetica')
-     .text(`Position: ${data.position}`)
-     .text(`Start Date: ${data.startDate || 'To be determined'}`)
-     .text(`Salary: ${data.salary || 'To be discussed'}`);
-  
-  if (data.benefits) {
-    doc.text(`Benefits: ${data.benefits}`);
-  }
-  
-  doc.moveDown(1);
-  
-  // Performance summary
-  doc.fontSize(14)
-     .font('Helvetica-Bold')
-     .text('Performance Summary:', { align: 'left' });
-  
-  doc.moveDown(0.5);
-  doc.fontSize(12)
-     .font('Helvetica')
-     .text(`Assessment Score: ${data.assessmentScore}/100`)
-     .text(`Interview Rating: ${data.interviewRating}/5`);
-  
-  doc.moveDown(1);
-  
-  // Additional notes
-  if (data.notes) {
-    doc.fontSize(12)
-       .text(`Additional Terms: ${data.notes}`);
-    doc.moveDown(1);
-  }
-  
-  // Closing
-  doc.fontSize(12)
-     .text('We look forward to welcoming you to our team. Please confirm your acceptance of this offer by signing and returning this letter within 7 days.', { align: 'justify' });
-  
-  doc.moveDown(2);
-  
-  // Signature section
-  doc.text('Sincerely,')
-     .moveDown(1)
-     .text(data.hrName)
-     .text(data.hrEmail)
-     .text(data.companyName);
-  
-  doc.moveDown(2);
-  
-  // Candidate signature
-  doc.text('Candidate Signature: _________________________')
-     .text('Date: _________________________');
-  
-  doc.end();
-  
-  return new Promise((resolve, reject) => {
-    doc.on('end', () => {
-      const pdfBuffer = Buffer.concat(buffers);
-      resolve(pdfBuffer);
-    });
+// Generate offer letter preview (PDF with letterhead)
+app.post('/api/offers/preview', authenticateJWT, async (req, res) => {
+  try {
+    const { offerHtml, hasLetterhead, letterheadUrl } = req.body;
     
-    doc.on('error', reject);
-  });
-}
+    if (!offerHtml) {
+      return res.status(400).json({ success: false, error: 'offerHtml is required' });
+    }
+
+    // Use the offerLetterService to generate PDF with letterhead
+    const { generatePDFFromHTMLWithLetterhead } = require('./services/offerLetterService');
+    
+    let pdfBuffer;
+    
+    if (hasLetterhead && letterheadUrl) {
+      // Generate PDF with letterhead merging
+      pdfBuffer = await generatePDFFromHTMLWithLetterhead(offerHtml, req.user.id);
+    } else {
+      // Generate PDF without letterhead
+      const { generatePDFFromHTML } = require('./services/offerLetterService');
+      pdfBuffer = await generatePDFFromHTML(offerHtml);
+    }
+    
+    // Send PDF as response
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', 'inline; filename="offer_preview.pdf"');
+    res.send(pdfBuffer);
+    
+  } catch (error) {
+    console.error('Error generating offer preview:', error);
+    res.status(500).json({ success: false, error: 'Failed to generate offer preview' });
+  }
+});
+
 
 // Send professional rejection email
 async function sendProfessionalRejectionEmail(data) {

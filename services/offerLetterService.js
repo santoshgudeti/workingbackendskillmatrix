@@ -1,6 +1,8 @@
 const PDFDocument = require('pdfkit');
 const fs = require('fs');
 const path = require('path');
+const pdfMergeService = require('./pdfMergeService');
+const letterheadService = require('./letterheadService');
 
 // Professional Offer Letter Templates
 const getOfferLetterTemplate = (templateType = 'professional') => {
@@ -30,14 +32,58 @@ const getOfferLetterTemplate = (templateType = 'professional') => {
   return templates[templateType] || templates.professional;
 };
 
+// Helper function to format currency
+const formatCurrency = (amount) => {
+  if (!amount) return '0';
+  const num = typeof amount === 'string' ? parseFloat(amount.replace(/[^0-9.-]+/g, '')) : amount;
+  return isNaN(num) ? '0' : num.toLocaleString('en-IN');
+};
+
+// Helper function to calculate CTC breakdown
+const calculateCTCBreakdown = (data) => {
+  const grossCTC = parseFloat(data.salary) || 0;
+  
+  // If detailed components are provided, use them; otherwise calculate defaults
+  const basic = data.basic ? parseFloat(data.basic) : Math.round(grossCTC * 0.40);
+  const hra = data.hra ? parseFloat(data.hra) : Math.round(grossCTC * 0.20);
+  const allowance = data.allowance ? parseFloat(data.allowance) : Math.round(grossCTC * 0.30);
+  const employerPf = data.employerPf ? parseFloat(data.employerPf) : Math.round(basic * 0.12);
+  
+  return {
+    basic,
+    hra,
+    allowance,
+    employerPf,
+    gross: grossCTC,
+    basicMonthly: Math.round(basic / 12),
+    hraMonthly: Math.round(hra / 12),
+    allowanceMonthly: Math.round(allowance / 12),
+    employerPfMonthly: Math.round(employerPf / 12),
+    grossMonthly: Math.round(grossCTC / 12)
+  };
+};
+    
 // Professional Template
 const generateProfessionalTemplate = (data) => {
+  // Fix typos and encoding issues - ensure clean text
+  const companyName = (data.companyName || 'Cognibotz').trim();
+  const candidateName = (data.candidateName || 'Candidate Name').trim();
+  
+  // Calculate CTC breakdown
+  const ctc = calculateCTCBreakdown(data);
+  
+  // Calculate offer validity date (default 7 days from issue date)
+  const issueDate = data.offerDate ? new Date(data.offerDate) : new Date();
+  const defaultValidUntil = new Date(issueDate);
+  defaultValidUntil.setDate(defaultValidUntil.getDate() + 7);
+  const validUntilDate = data.offerValidUntil ? new Date(data.offerValidUntil) : defaultValidUntil;
+  
   return `
 <!DOCTYPE html>
 <html>
 <head>
   <meta charset="utf-8">
-  <title>Offer Letter - ${data.candidateName}</title>
+  <title>Offer Letter - ${candidateName}</title>
   <style>
     @page { 
       size: A4; 
@@ -51,210 +97,141 @@ const generateProfessionalTemplate = (data) => {
     }
     
     body {
-      font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-      line-height: 1.6;
-      color: #333;
+      font-family: 'Calibri', Arial, sans-serif;
+      font-size: 12pt;
+      line-height: 1.5;
+      color: #111;
       background: #fff;
     }
     
     .page {
-      width: 210mm;
-      min-height: 297mm;
-      padding: 20mm;
-      margin: 0 auto;
-      background: white;
-      box-shadow: 0 0 10px rgba(0,0,0,0.1);
+      width: 100%;
+      padding: 180px 40px 120px 40px; /* space for letterhead header + footer */
+      box-sizing: border-box;
     }
     
-    .header {
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-      border-bottom: 3px solid #2563eb;
-      padding-bottom: 20px;
-      margin-bottom: 30px;
-    }
-    
-    .company-info h1 {
-      color: #2563eb;
-      font-size: 28px;
-      font-weight: 700;
-      margin-bottom: 5px;
-    }
-    
-    .company-info p {
-      color: #666;
-      font-size: 14px;
+    .page-content {
+      width: 100%;
     }
     
     .date {
       text-align: right;
-      color: #666;
-      font-size: 14px;
-    }
-    
-    .candidate-info {
       margin-bottom: 30px;
-      padding: 20px;
-      background: #f8fafc;
-      border-left: 4px solid #2563eb;
     }
     
-    .candidate-info h3 {
-      color: #2563eb;
-      margin-bottom: 10px;
+    .candidate-address {
+      margin-bottom: 40px;
     }
     
-    .subject {
-      font-size: 18px;
-      font-weight: 600;
-      color: #2563eb;
-      margin-bottom: 20px;
+    .subject-line {
       text-align: center;
+      font-weight: bold;
+      margin: 30px 0;
       text-transform: uppercase;
-      letter-spacing: 1px;
     }
     
-    .content {
-      margin-bottom: 30px;
+    .salutation {
+      margin-bottom: 20px;
     }
     
-    .content p {
-      margin-bottom: 15px;
+    .paragraph {
+      margin: 0 0 12px 0;
       text-align: justify;
     }
     
-    .offer-details {
-      background: #f0f9ff;
-      border: 1px solid #bae6fd;
-      border-radius: 8px;
-      padding: 25px;
+    h2 {
+      font-size: 13pt;
+      margin: 0 0 8px 0;
+      font-weight: 600;
+    }
+    
+    .section {
       margin: 25px 0;
     }
     
-    .offer-details h3 {
-      color: #0369a1;
+    .section-title {
+      font-weight: bold;
       margin-bottom: 15px;
-      font-size: 18px;
+      border-bottom: 1px solid #000;
+      padding-bottom: 5px;
+      font-size: 14pt;
     }
     
-    .detail-row {
+    .kv {
       display: flex;
-      justify-content: space-between;
+      gap: 16px;
       margin-bottom: 10px;
-      padding: 8px 0;
-      border-bottom: 1px dotted #cbd5e1;
     }
     
-    .detail-row:last-child {
-      border-bottom: none;
-    }
-    
-    .detail-label {
+    .kv .label {
+      width: 35%;
       font-weight: 600;
-      color: #475569;
     }
     
-    .detail-value {
-      color: #1e293b;
-      font-weight: 500;
+    .kv .value {
+      width: 65%;
     }
     
-    .salary-breakdown {
-      margin: 30px 0;
-    }
-    
-    .salary-table {
+    .ctc-table {
       width: 100%;
       border-collapse: collapse;
-      margin-top: 15px;
+      margin: 8px 0 16px 0;
     }
     
-    .salary-table th,
-    .salary-table td {
-      border: 1px solid #d1d5db;
-      padding: 12px;
+    .ctc-table th,
+    .ctc-table td {
+      padding: 8px;
+      border: 1px solid #e6e6e6;
       text-align: left;
+      font-size: 11.5pt;
     }
     
-    .salary-table th {
-      background: #f3f4f6;
-      font-weight: 600;
-      color: #374151;
-    }
-    
-    .salary-table .total-row {
-      background: #fef3c7;
-      font-weight: 600;
-    }
-    
-    .terms-section {
-      margin: 30px 0;
-    }
-    
-    .terms-section h3 {
-      color: #dc2626;
-      margin-bottom: 15px;
-      font-size: 16px;
+    .ctc-table th {
+      background: #fafafa;
+      font-weight: bold;
     }
     
     .terms-list {
-      list-style: none;
-      counter-reset: term-counter;
+      margin: 20px 0;
+      padding-left: 20px;
     }
     
     .terms-list li {
-      counter-increment: term-counter;
       margin-bottom: 10px;
-      padding-left: 30px;
-      position: relative;
+      page-break-inside: avoid;
     }
     
-    .terms-list li::before {
-      content: counter(term-counter) ".";
-      position: absolute;
-      left: 0;
-      font-weight: 600;
-      color: #dc2626;
+    .signature {
+      margin-top: 40px;
+      page-break-inside: avoid;
     }
     
     .signature-section {
-      margin-top: 50px;
       display: flex;
       justify-content: space-between;
+      page-break-inside: avoid;
     }
     
     .signature-box {
       width: 45%;
-      text-align: center;
+    }
+    
+    .signature .hr {
+      margin-bottom: 48px;
     }
     
     .signature-line {
-      border-top: 2px solid #374151;
-      margin-top: 50px;
+      margin-top: 80px;
+      border-top: 1px solid #000;
       padding-top: 10px;
     }
     
-    .acceptance-section {
-      margin-top: 40px;
-      padding: 20px;
-      background: #fef7cd;
-      border-radius: 8px;
-      border: 1px solid #fbbf24;
-    }
-    
-    .acceptance-section h3 {
-      color: #92400e;
-      margin-bottom: 15px;
-    }
-    
     .footer {
-      margin-top: 40px;
+      font-size: 10pt;
+      color: #666;
+      margin-top: 20px;
+      font-style: italic;
       text-align: center;
-      font-size: 12px;
-      color: #6b7280;
-      border-top: 1px solid #e5e7eb;
-      padding-top: 20px;
     }
     
     @media print {
@@ -267,135 +244,245 @@ const generateProfessionalTemplate = (data) => {
 </head>
 <body>
   <div class="page">
-    <div class="header">
-      <div class="company-info">
-        <h1>${data.companyName || 'Company Name'}</h1>
-        <p>Human Resources Department</p>
-        <p>${data.companyAddress || 'Company Address'}</p>
-      </div>
+    <div class="page-content">
       <div class="date">
-        <strong>Date:</strong> ${new Date().toLocaleDateString('en-US', { 
+        <p>Date: ${issueDate.toLocaleDateString('en-US', { 
           year: 'numeric', 
           month: 'long', 
           day: 'numeric' 
-        })}
-      </div>
-    </div>
-
-    <div class="candidate-info">
-      <h3>To:</h3>
-      <p><strong>${data.candidateName}</strong></p>
-      <p>${data.candidateEmail}</p>
-      ${data.candidateAddress ? `<p>${data.candidateAddress}</p>` : ''}
-    </div>
-
-    <div class="subject">
-      Offer of Employment
-    </div>
-
-    <div class="content">
-      <p>Dear ${data.candidateName},</p>
-      
-      <p>We are pleased to extend this formal offer of employment to you for the position of <strong>${data.position}</strong> at ${data.companyName}. After careful consideration of your qualifications, experience, and performance during our interview process, we believe you will be a valuable addition to our team.</p>
-
-      <div class="offer-details">
-        <h3>Position Details</h3>
-        <div class="detail-row">
-          <span class="detail-label">Position Title:</span>
-          <span class="detail-value">${data.position}</span>
-        </div>
-        <div class="detail-row">
-          <span class="detail-label">Department:</span>
-          <span class="detail-value">${data.department || 'To be assigned'}</span>
-        </div>
-        <div class="detail-row">
-          <span class="detail-label">Start Date:</span>
-          <span class="detail-value">${data.startDate}</span>
-        </div>
-        <div class="detail-row">
-          <span class="detail-label">Employment Type:</span>
-          <span class="detail-value">${data.employmentType || 'Full-time'}</span>
-        </div>
-        <div class="detail-row">
-          <span class="detail-label">Reporting Manager:</span>
-          <span class="detail-value">${data.reportingManager || 'To be assigned'}</span>
-        </div>
-        <div class="detail-row">
-          <span class="detail-label">Work Location:</span>
-          <span class="detail-value">${data.workLocation || 'Office'}</span>
-        </div>
+        })}</p>
       </div>
 
-      ${data.salaryBreakdown ? generateSalaryBreakdown(data.salaryBreakdown) : ''}
-
-      <p>Your annual gross salary will be <strong>${data.salary}</strong>, payable in monthly installments as per company payroll schedule. This package includes all statutory benefits as per applicable labor laws.</p>
-
-      ${data.benefits ? `
-      <div class="offer-details">
-        <h3>Benefits & Perquisites</h3>
-        <p>${data.benefits}</p>
+      <div class="candidate-address">
+        <p><strong>${candidateName}</strong></p>
+        ${data.candidateAddress ? `<p>${data.candidateAddress}</p>` : ''}
+        <p>${data.candidateEmail || 'candidate@example.com'}</p>
       </div>
-      ` : ''}
 
-      <div class="terms-section">
-        <h3>Terms and Conditions</h3>
+      <div class="subject-line">
+        <p>Subject: OFFER OF EMPLOYMENT</p>
+      </div>
+
+      <div class="salutation">
+        <p>Dear ${candidateName},</p>
+      </div>
+
+      <div class="paragraph">
+        <p>We are pleased to offer you the position of <strong>${data.position || 'Position Title'}</strong> with ${companyName}. Your employment will commence on <strong>${data.startDate ? new Date(data.startDate).toLocaleDateString('en-US', { 
+          year: 'numeric', 
+          month: 'long', 
+          day: 'numeric' 
+        }) : 'the start date'}</strong> and will be subject to the terms and conditions set out below. After careful consideration of your qualifications and interview performance, we are confident you will make a valuable contribution to our team.</p>
+      </div>
+
+      <div class="section">
+        <div class="section-title">Position Details</div>
+        <div class="kv">
+          <div class="label">Position Title:</div>
+          <div class="value">${data.position || 'Position Title'}</div>
+        </div>
+        <div class="kv">
+          <div class="label">Department:</div>
+          <div class="value">${data.department || 'To be assigned'}</div>
+        </div>
+        <div class="kv">
+          <div class="label">Start Date:</div>
+          <div class="value">${data.startDate ? new Date(data.startDate).toLocaleDateString('en-US', { 
+            year: 'numeric', 
+            month: 'long', 
+            day: 'numeric' 
+          }) : 'To be determined'}</div>
+        </div>
+        <div class="kv">
+          <div class="label">Employment Type:</div>
+          <div class="value">${data.employmentType || 'Full-time'}</div>
+        </div>
+        <div class="kv">
+          <div class="label">Reporting Manager:</div>
+          <div class="value">${data.reportingManager || 'To be assigned'}</div>
+        </div>
+        <div class="kv">
+          <div class="label">Work Location:</div>
+          <div class="value">${data.workLocation || 'Office'}</div>
+        </div>
+        <div class="kv">
+          <div class="label">Working Hours:</div>
+          <div class="value">${data.workingHours || '9:00 AM to 6:00 PM, Monday to Friday'}</div>
+        </div>
+      </div>
+
+      <div class="section">
+        <div class="section-title">Compensation</div>
+        <div class="paragraph">
+          <p>Your total annual cost-to-company (CTC) is <strong>₹${formatCurrency(ctc.gross)}</strong> per annum, payable in monthly installments as per company payroll policies. The detailed breakdown is as follows:</p>
+        </div>
+        
+        <table class="ctc-table">
+          <thead>
+            <tr>
+              <th>Component</th>
+              <th>Monthly (₹)</th>
+              <th>Annual (₹)</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Basic Salary</td>
+              <td>${formatCurrency(ctc.basicMonthly)}</td>
+              <td>${formatCurrency(ctc.basic)}</td>
+            </tr>
+            <tr>
+              <td>HRA (House Rent Allowance)</td>
+              <td>${formatCurrency(ctc.hraMonthly)}</td>
+              <td>${formatCurrency(ctc.hra)}</td>
+            </tr>
+            <tr>
+              <td>Special Allowance</td>
+              <td>${formatCurrency(ctc.allowanceMonthly)}</td>
+              <td>${formatCurrency(ctc.allowance)}</td>
+            </tr>
+            <tr>
+              <td>Employer PF Contribution</td>
+              <td>${formatCurrency(ctc.employerPfMonthly)}</td>
+              <td>${formatCurrency(ctc.employerPf)}</td>
+            </tr>
+            <tr>
+              <td><strong>Gross CTC</strong></td>
+              <td><strong>${formatCurrency(ctc.grossMonthly)}</strong></td>
+              <td><strong>${formatCurrency(ctc.gross)}</strong></td>
+            </tr>
+          </tbody>
+        </table>
+        
+        ${data.benefits ? `
+        <div class="paragraph">
+          <p><strong>Benefits & Perquisites:</strong></p>
+          <ul class="terms-list">
+            ${data.benefits.split('\n').filter(b => b.trim()).map(benefit => `<li>${benefit.trim()}</li>`).join('')}
+          </ul>
+        </div>
+        ` : ''}
+      </div>
+
+      <div class="section">
+        <div class="section-title">Statutory Benefits</div>
+        <div class="paragraph">
+          <p>Your compensation package includes the following statutory benefits as per applicable Indian labor laws:</p>
+          <ul class="terms-list">
+            <li><strong>Provident Fund (PF)</strong> - As per EPF Act, 1952</li>
+            <li><strong>Employee State Insurance (ESI)</strong> - If applicable based on salary criteria</li>
+            <li><strong>Gratuity</strong> - As per Payment of Gratuity Act, 1972</li>
+            <li><strong>Medical Insurance</strong> - Group health insurance coverage as per company policy</li>
+            <li><strong>Leave Policy</strong> - Casual Leave, Sick Leave, and Privilege Leave as per company policy</li>
+          </ul>
+        </div>
+      </div>
+
+      <div class="section">
+        <div class="section-title">Terms and Conditions</div>
         <ol class="terms-list">
-          <li>This offer is contingent upon successful completion of background verification and reference checks.</li>
-          <li>You will be subject to a probationary period of ${data.probationPeriod || '3 months'} from your start date.</li>
-          <li>Your employment will be governed by the company's policies, procedures, and employee handbook.</li>
-          <li>You agree to maintain confidentiality of all proprietary and confidential information.</li>
-          <li>The notice period for resignation is ${data.noticePeriod || '30 days'} or payment in lieu thereof.</li>
-          <li>This offer is valid until ${data.offerValidUntil || 'one week from the date of this letter'}.</li>
-          ${data.additionalTerms ? data.additionalTerms.split('\n').map(term => `<li>${term}</li>`).join('') : ''}
+          <li><strong>Background Verification:</strong> This offer is contingent upon successful completion of background verification, reference checks, and document verification.</li>
+          <li><strong>Probation Period:</strong> You will be subject to a probationary period of ${data.probationPeriod || '3 months'} from your start date. During this period, your performance will be evaluated against predetermined criteria.</li>
+          <li><strong>Confirmation:</strong> Upon successful completion of the probation period, you will be confirmed in the position based on satisfactory performance evaluation.</li>
+          <li><strong>Company Policies:</strong> Your employment will be governed by the company's policies, procedures, and employee handbook, which will be provided to you upon joining.</li>
+          <li><strong>Confidentiality:</strong> You agree to maintain strict confidentiality of all proprietary, confidential, and sensitive information pertaining to the company, its clients, and business operations.</li>
+          <li><strong>Notice Period:</strong> The notice period for resignation is ${data.noticePeriod || '30 days'} or payment in lieu thereof as per company policy.</li>
+          <li><strong>Termination:</strong> The company reserves the right to terminate your employment for cause as per company policies, applicable labor laws, and without notice in cases of gross misconduct.</li>
+          <li><strong>Offer Validity:</strong> This offer is valid until <strong>${validUntilDate.toLocaleDateString('en-US', { 
+            year: 'numeric', 
+            month: 'long', 
+            day: 'numeric' 
+          })}</strong>. If we do not receive your acceptance by this date, this offer will lapse.</li>
         </ol>
       </div>
 
-      <p>We are excited about the prospect of you joining our team and contributing to our continued success. Please confirm your acceptance of this offer by signing and returning this letter by the specified deadline.</p>
-
-      <p>If you have any questions regarding this offer, please don't hesitate to contact me directly.</p>
-
-      <p>We look forward to welcoming you to ${data.companyName}!</p>
-    </div>
-
-    <div class="signature-section">
-      <div class="signature-box">
-        <p><strong>Sincerely,</strong></p>
-        <div class="signature-line">
-          <p>${data.hrName || 'HR Manager'}</p>
-          <p>${data.hrTitle || 'Human Resources'}</p>
-          <p>${data.companyName}</p>
-          <p>${data.hrEmail || ''}</p>
+      <div class="section">
+        <div class="section-title">Joining Formalities</div>
+        <div class="paragraph">
+          <p><strong>On your first day of employment, please complete the following formalities:</strong></p>
+        </div>
+        
+        <div class="paragraph">
+          <p><strong>Reporting Details:</strong></p>
+          <ul class="terms-list">
+            <li>Reporting Time: 10:00 AM</li>
+            <li>Reporting Location: ${data.workLocation || data.companyAddress || 'Office Address'}</li>
+            <li>Contact Person on Day 1: ${data.reportingManager || data.hrName || 'HR Manager'}</li>
+            <li>Contact Details: ${data.hrContact || data.hrEmail || 'HR Email/Phone'}</li>
+          </ul>
+        </div>
+        
+        <div class="paragraph">
+          <p><strong>Required documents to bring on day 1 (Originals + one set of photocopies):</strong></p>
+          <ul class="terms-list">
+            <li>Educational certificates (10th, 12th, Graduation, Post-Graduation, etc.)</li>
+            <li>Identity proof (Aadhaar Card / PAN Card / Passport)</li>
+            <li>Address proof (Aadhaar Card / Voter ID / Utility Bill)</li>
+            <li>Previous employment experience letters and relieving letters (if any)</li>
+            <li>Passport size photographs (4 copies)</li>
+            <li>Bank account details (Cancelled cheque with your name printed)</li>
+            <li>Emergency contact information (filled form will be provided)</li>
+          </ul>
         </div>
       </div>
-      
-      <div class="signature-box">
-        <p><strong>Accepted by:</strong></p>
-        <div class="signature-line">
-          <p>${data.candidateName}</p>
-          <p>Date: _______________</p>
+
+      <div class="section">
+        <div class="section-title">Acceptance Instructions</div>
+        <div class="paragraph">
+          <p>This offer is valid until <strong>${validUntilDate.toLocaleDateString('en-US', { 
+            year: 'numeric', 
+            month: 'long', 
+            day: 'numeric' 
+          })}</strong>. To accept this offer, please sign below and email a scanned copy to <strong>${data.hrEmail || data.hrContact || 'hr@company.com'}</strong> or reply to this offer with the subject line "Offer Acceptance – ${candidateName}". If we do not receive your acceptance by ${validUntilDate.toLocaleDateString('en-US', { 
+            year: 'numeric', 
+            month: 'long', 
+            day: 'numeric' 
+          })}, this offer will lapse.</p>
         </div>
       </div>
-    </div>
 
-    <div class="acceptance-section">
-      <h3>Important Instructions</h3>
-      <p>To accept this offer:</p>
-      <ol>
-        <li>Sign and date this letter in the space provided above</li>
-        <li>Return the signed copy via email or in person</li>
-        <li>Prepare necessary documents for joining formalities</li>
-        <li>Contact HR for any clarifications</li>
-      </ol>
-    </div>
+      <div class="paragraph">
+        <p>We are excited about the prospect of you joining our team and contributing to our continued success. If you have any questions regarding this offer, please don't hesitate to contact ${data.hrName || 'HR Manager'} at ${data.hrEmail || data.hrContact || 'HR Email/Phone'}.</p>
+      </div>
 
-    <div class="footer">
-      <p>This is a confidential document intended solely for ${data.candidateName}.</p>
-      <p>© ${new Date().getFullYear()} ${data.companyName}. All rights reserved.</p>
+      <div class="paragraph">
+        <p>We look forward to welcoming you to ${companyName}!</p>
+      </div>
+
+      <div class="signature">
+        <div class="signature-section">
+          <div class="signature-box">
+            <p>Sincerely,</p>
+            <div class="signature-line">
+              <p><strong>${data.hrName || 'HR Manager'}</strong></p>
+              <p>${data.hrTitle || 'Human Resources'}</p>
+              <p>${companyName}</p>
+              ${data.companyAddress ? `<p>${data.companyAddress}</p>` : ''}
+              ${data.hrEmail ? `<p>Email: ${data.hrEmail}</p>` : ''}
+              ${data.hrPhone ? `<p>Phone: ${data.hrPhone}</p>` : ''}
+            </div>
+          </div>
+          
+          <div class="signature-box">
+            <p>Accepted by:</p>
+            <div class="signature-line">
+              <p><strong>${candidateName}</strong></p>
+              <p>Signature: ___________________</p>
+              <p>Date: _______________________</p>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="footer">
+        <p>This is a confidential document intended solely for ${candidateName}.</p>
+        <p>Please refer to the Employee Handbook for detailed company policies and procedures.</p>
+      </div>
     </div>
   </div>
 </body>
 </html>`;
-};
+}
 
 // Generate salary breakdown table
 const generateSalaryBreakdown = (breakdown) => {
@@ -493,33 +580,82 @@ const generateFormalTemplate = (data) => {
 
 // Generate PDF from HTML
 const generatePDFFromHTML = async (htmlContent) => {
-  const puppeteer = require('puppeteer');
+  const htmlToPdf = require('html-pdf');
   
   try {
-    const browser = await puppeteer.launch({
-      headless: true,
-      args: ['--no-sandbox', '--disable-setuid-sandbox']
+    const pdfBuffer = await new Promise((resolve, reject) => {
+      htmlToPdf.create(htmlContent, { 
+        format: 'A4', 
+        border: '10mm',
+        type: 'pdf',
+        timeout: 30000
+      }).toBuffer((err, buffer) => {
+        if (err) return reject(err);
+        resolve(buffer);
+      });
     });
     
-    const page = await browser.newPage();
-    await page.setContent(htmlContent, { waitUntil: 'networkidle0' });
-    
-    const pdfBuffer = await page.pdf({
-      format: 'A4',
-      printBackground: true,
-      margin: {
-        top: '0mm',
-        right: '0mm',
-        bottom: '0mm',
-        left: '0mm'
-      }
-    });
-    
-    await browser.close();
     return pdfBuffer;
     
   } catch (error) {
     console.error('Error generating PDF:', error);
+    throw error;
+  }
+};
+
+// Generate PDF from HTML with letterhead merging
+const generatePDFFromHTMLWithLetterhead = async (htmlContent, companyId) => {
+  try {
+    console.log('📝 [OFFER SERVICE] Starting PDF generation with letterhead merging for company:', companyId);
+    
+    // Generate the content PDF first
+    const startTime = Date.now();
+    const contentPdfBuffer = await generatePDFFromHTML(htmlContent);
+    const contentGenerationTime = Date.now() - startTime;
+    
+    console.log('📝 [OFFER SERVICE] Content PDF generated:', { 
+      size: contentPdfBuffer.length, 
+      generationTime: contentGenerationTime + 'ms' 
+    });
+    
+    // Check if company has an active letterhead
+    const letterhead = await letterheadService.getActiveLetterhead(companyId);
+    
+    console.log('🔍 [OFFER SERVICE] Letterhead check result:', { 
+      letterheadFound: !!letterhead,
+      letterheadId: letterhead?._id,
+      companyId
+    });
+    
+    if (letterhead) {
+      console.log('📝 [OFFER SERVICE] Merging with letterhead:', { 
+        letterheadId: letterhead._id, 
+        s3Key: letterhead.s3Key 
+      });
+      
+      // Merge with letterhead
+      const mergeStartTime = Date.now();
+      const mergedPdfBuffer = await pdfMergeService.mergeWithLetterhead(
+        contentPdfBuffer, 
+        letterhead.s3Key
+      );
+      const mergeTime = Date.now() - mergeStartTime;
+      
+      console.log('✅ [OFFER SERVICE] PDF merge completed successfully:', { 
+        finalSize: mergedPdfBuffer.length, 
+        mergeTime: mergeTime + 'ms',
+        totalTime: (contentGenerationTime + mergeTime) + 'ms'
+      });
+      
+      return mergedPdfBuffer;
+    }
+    
+    // Return content-only PDF if no letterhead
+    console.log('📝 [OFFER SERVICE] No letterhead found, returning content-only PDF');
+    return contentPdfBuffer;
+    
+  } catch (error) {
+    console.error('❌ [OFFER SERVICE] Error generating PDF with letterhead:', error);
     throw error;
   }
 };
@@ -537,6 +673,7 @@ const getAvailableTemplates = () => {
 module.exports = {
   getOfferLetterTemplate,
   generatePDFFromHTML,
+  generatePDFFromHTMLWithLetterhead,
   getAvailableTemplates,
   generateProfessionalTemplate,
   generateExecutiveTemplate,
