@@ -9699,6 +9699,10 @@ app.get('/api/candidate-decisions', authenticateJWT, async (req, res) => {
 const documentCollectionRoutes = require('./routes/documentCollectionRoutes');
 app.use('/api/document-collection', authenticateJWT, documentCollectionRoutes);
 
+// Lead Capture Routes (No authentication required)
+const leadRoutes = require('./routes/leadRoutes');
+app.use('/api', leadRoutes);
+
 
 // Health check endpoint
 app.get('/health', (req, res) => {
