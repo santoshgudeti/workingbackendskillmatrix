@@ -6,10 +6,28 @@ const path = require('path');
 
 /**
  * Letterhead Service
- * Handles letterhead upload, storage, and retrieval
+ * Handles uploading, storing, and retrieving company letterheads for offer letter generation
  */
 class LetterheadService {
   constructor() {
+    // Initialize S3 client only when needed, not during construction
+    this.bucketName = null;
+    this.s3Client = null;
+    this.upload = null;
+  }
+  
+  /**
+   * Initialize the S3 client with environment variables
+   * This ensures env vars are loaded before creating the client
+   */
+  initialize() {
+    if (this.s3Client) return; // Already initialized
+    
+    // Check if required environment variables are present
+    if (!process.env.MINIO_ENDPOINT) {
+      throw new Error('MINIO_ENDPOINT is not defined in environment variables');
+    }
+    
     this.s3Client = new S3Client({
       region: process.env.MINIO_REGION || process.env.AWS_REGION || 'auto',
       endpoint: process.env.MINIO_SECURE === 'true' || process.env.MINIO_SECURE === 'True' 
@@ -52,6 +70,9 @@ class LetterheadService {
    */
   async uploadLetterhead(file, companyId) {
     try {
+      // Initialize S3 client if not already done
+      this.initialize();
+      
       console.log('📤 [LETTERHEAD] Uploading letterhead:', { 
         originalName: file.originalname, 
         size: file.size, 
@@ -149,6 +170,9 @@ class LetterheadService {
    */
   async getActiveLetterhead(companyId) {
     try {
+      // Initialize S3 client if not already done
+      this.initialize();
+      
       console.log('🔍 [LETTERHEAD] Looking for active letterhead for company:', companyId);
       
       const letterhead = await Letterhead.findOne({
@@ -177,6 +201,9 @@ class LetterheadService {
    */
   async generatePreviewUrl(s3Key) {
     try {
+      // Initialize S3 client if not already done
+      this.initialize();
+      
       const command = new GetObjectCommand({
         Bucket: this.bucketName,
         Key: s3Key,
@@ -197,6 +224,9 @@ class LetterheadService {
    * @returns {Function} - Multer upload middleware
    */
   getUploadMiddleware() {
+    // Initialize S3 client if not already done
+    this.initialize();
+    
     return this.upload.single('letterhead');
   }
 
@@ -208,6 +238,11 @@ class LetterheadService {
    */
   async cleanupOldLetterheads(companyId, daysOld = 30) {
     try {
+      // Initialize S3 client if not already done
+      this.initialize();
+      
+      console.log(`🧹 [LETTERHEAD] Cleaning up letterheads older than ${daysOld} days for company:`, companyId);
+      
       const cutoffDate = new Date(Date.now() - daysOld * 24 * 60 * 60 * 1000);
       
       // Find old letterheads

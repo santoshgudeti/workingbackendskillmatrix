@@ -39,15 +39,141 @@ const formatCurrency = (amount) => {
   return isNaN(num) ? '0' : num.toLocaleString('en-IN');
 };
 
-// Helper function to calculate CTC breakdown
+// Helper function to calculate Professional Tax based on monthly gross salary
+const calculateProfessionalTax = (monthlyGross) => {
+  // Professional Tax slabs (varies by state, using common Maharashtra slabs)
+  if (monthlyGross <= 0) return 0;
+  if (monthlyGross <= 7500) return 0;
+  if (monthlyGross <= 10000) return 175;
+  if (monthlyGross <= 25000) return 200;
+  return 200; // Max PT in most states
+};
+
+// Helper function to calculate ESI (Employee State Insurance)
+const calculateESI = (monthlyGross) => {
+  // ESI applicable only if monthly gross < ₹21,000
+  if (monthlyGross <= 0 || monthlyGross >= 21000) return 0;
+  return Math.round(monthlyGross * 0.0075); // 0.75% employee contribution
+};
+
+// Helper function to calculate CTC breakdown with deductions
 const calculateCTCBreakdown = (data) => {
+  console.log('🔢 [SALARY CALC] Received data for CTC breakdown:', {
+    salary: data.salary,
+    basic: data.basic,
+    hra: data.hra,
+    allowance: data.allowance,
+    employerPf: data.employerPf
+  });
+  
   const grossCTC = parseFloat(data.salary) || 0;
   
-  // If detailed components are provided, use them; otherwise calculate defaults
-  const basic = data.basic ? parseFloat(data.basic) : Math.round(grossCTC * 0.40);
-  const hra = data.hra ? parseFloat(data.hra) : Math.round(grossCTC * 0.20);
-  const allowance = data.allowance ? parseFloat(data.allowance) : Math.round(grossCTC * 0.30);
-  const employerPf = data.employerPf ? parseFloat(data.employerPf) : Math.round(basic * 0.12);
+  // Validation: Return zeros if no salary provided
+  if (grossCTC <= 0) {
+    console.log('⚠️ [SALARY CALC] Invalid or zero salary provided, returning zeros');
+    return {
+      basic: 0,
+      hra: 0,
+      allowance: 0,
+      employerPf: 0,
+      gross: 0,
+      basicMonthly: 0,
+      hraMonthly: 0,
+      allowanceMonthly: 0,
+      employerPfMonthly: 0,
+      grossMonthly: 0,
+      employeePf: 0,
+      employeePfMonthly: 0,
+      professionalTax: 0,
+      professionalTaxAnnual: 0,
+      esi: 0,
+      esiAnnual: 0,
+      totalDeductionsMonthly: 0,
+      totalDeductionsAnnual: 0,
+      netMonthly: 0,
+      netAnnual: 0,
+      isValid: false
+    };
+  }
+  
+  // Parse user-provided values properly - handle both string and number inputs
+  const parseValue = (val) => {
+    if (val === null || val === undefined || val === '') return null;
+    const parsed = typeof val === 'string' ? parseFloat(val.replace(/[^0-9.-]+/g, '')) : parseFloat(val);
+    return isNaN(parsed) || parsed <= 0 ? null : parsed;
+  };
+  
+  // Use user-provided values if available and valid, otherwise calculate defaults
+  const basicProvided = parseValue(data.basic);
+  const hraProvided = parseValue(data.hra);
+  const allowanceProvided = parseValue(data.allowance);
+  const employerPfProvided = parseValue(data.employerPf);
+  
+  // Calculate components - prioritize user input
+  const basic = basicProvided !== null ? basicProvided : Math.round(grossCTC * 0.40);
+  const hra = hraProvided !== null ? hraProvided : Math.round(grossCTC * 0.20);
+  const allowance = allowanceProvided !== null ? allowanceProvided : Math.round(grossCTC * 0.30);
+  const employerPf = employerPfProvided !== null ? employerPfProvided : Math.round(basic * 0.12);
+  
+  console.log('💰 [SALARY CALC] Calculated CTC components:', {
+    basic,
+    hra,
+    allowance,
+    employerPf,
+    source: {
+      basic: basicProvided !== null ? 'user-provided' : 'calculated',
+      hra: hraProvided !== null ? 'user-provided' : 'calculated',
+      allowance: allowanceProvided !== null ? 'user-provided' : 'calculated',
+      employerPf: employerPfProvided !== null ? 'user-provided' : 'calculated'
+    }
+  });
+  
+  // Calculate monthly values - keep precision, don't round yet to avoid cumulative errors
+  const basicMonthly = basic / 12;
+  const hraMonthly = hra / 12;
+  const allowanceMonthly = allowance / 12;
+  const employerPfMonthly = employerPf / 12;
+  const grossMonthly = grossCTC / 12;
+  
+  console.log('📅 [SALARY CALC] Monthly values calculated:', {
+    basicMonthly,
+    hraMonthly,
+    allowanceMonthly,
+    employerPfMonthly,
+    grossMonthly
+  });
+  
+  // Calculate deductions (monthly) - keep precision
+  const employeePfMonthly = basicMonthly * 0.12; // 12% of basic
+  const professionalTax = calculateProfessionalTax(Math.round(grossMonthly));
+  const esi = calculateESI(Math.round(grossMonthly));
+  
+  console.log('💸 [SALARY CALC] Monthly deductions calculated:', {
+    employeePfMonthly,
+    professionalTax,
+    esi
+  });
+  
+  // Calculate annual deductions
+  const employeePfAnnual = employeePfMonthly * 12;
+  const professionalTaxAnnual = professionalTax * 12;
+  const esiAnnual = esi * 12;
+  
+  // Total deductions
+  const totalDeductionsMonthly = employeePfMonthly + professionalTax + esi;
+  const totalDeductionsAnnual = employeePfAnnual + professionalTaxAnnual + esiAnnual;
+  
+  // Net salary (Take Home)
+  const netMonthly = grossMonthly - totalDeductionsMonthly;
+  const netAnnual = grossCTC - totalDeductionsAnnual;
+  
+  console.log('✅ [SALARY CALC] Final breakdown calculated:', {
+    totalDeductionsMonthly,
+    totalDeductionsAnnual,
+    netMonthly,
+    netAnnual,
+    isValid: true
+  });
   
   return {
     basic,
@@ -55,11 +181,23 @@ const calculateCTCBreakdown = (data) => {
     allowance,
     employerPf,
     gross: grossCTC,
-    basicMonthly: Math.round(basic / 12),
-    hraMonthly: Math.round(hra / 12),
-    allowanceMonthly: Math.round(allowance / 12),
-    employerPfMonthly: Math.round(employerPf / 12),
-    grossMonthly: Math.round(grossCTC / 12)
+    // Round monthly values only for display - preserve annual accuracy
+    basicMonthly: Math.round(basicMonthly),
+    hraMonthly: Math.round(hraMonthly),
+    allowanceMonthly: Math.round(allowanceMonthly),
+    employerPfMonthly: Math.round(employerPfMonthly),
+    grossMonthly: Math.round(grossMonthly),
+    employeePf: employeePfAnnual,
+    employeePfMonthly: Math.round(employeePfMonthly),
+    professionalTax,
+    professionalTaxAnnual,
+    esi,
+    esiAnnual,
+    totalDeductionsMonthly: Math.round(totalDeductionsMonthly),
+    totalDeductionsAnnual: Math.round(totalDeductionsAnnual),
+    netMonthly: Math.round(netMonthly),
+    netAnnual: Math.round(netAnnual),
+    isValid: true
   };
 };
     
@@ -175,13 +313,29 @@ const generateProfessionalTemplate = (data) => {
     .ctc-table {
       width: 100%;
       border-collapse: collapse;
-      margin: 8px 0 16px 0;
+      margin: 15px 0 25px 0;
+      table-layout: fixed;
+    }
+    
+    .ctc-table th:first-child,
+    .ctc-table td:first-child {
+      width: 50%;
+    }
+    
+    .ctc-table th:nth-child(2),
+    .ctc-table td:nth-child(2) {
+      width: 25%;
+    }
+    
+    .ctc-table th:nth-child(3),
+    .ctc-table td:nth-child(3) {
+      width: 25%;
     }
     
     .ctc-table th,
     .ctc-table td {
       padding: 8px;
-      border: 1px solid #e6e6e6;
+      border: 1px solid #ddd;
       text-align: left;
       font-size: 11.5pt;
     }
@@ -202,7 +356,7 @@ const generateProfessionalTemplate = (data) => {
     }
     
     .signature {
-      margin-top: 40px;
+      margin-top: 80px;
       page-break-inside: avoid;
     }
     
@@ -210,6 +364,7 @@ const generateProfessionalTemplate = (data) => {
       display: flex;
       justify-content: space-between;
       page-break-inside: avoid;
+      margin-top: 60px;
     }
     
     .signature-box {
@@ -229,9 +384,11 @@ const generateProfessionalTemplate = (data) => {
     .footer {
       font-size: 10pt;
       color: #666;
-      margin-top: 20px;
+      margin-top: 30px;
       font-style: italic;
       text-align: center;
+      border-top: 1px solid #ddd;
+      padding-top: 15px;
     }
     
     @media print {
@@ -312,51 +469,18 @@ const generateProfessionalTemplate = (data) => {
       </div>
 
       <div class="section">
-        <div class="section-title">Compensation</div>
+        <div class="section-title">Compensation & Benefits</div>
         <div class="paragraph">
-          <p>Your total annual cost-to-company (CTC) is <strong>₹${formatCurrency(ctc.gross)}</strong> per annum, payable in monthly installments as per company payroll policies. The detailed breakdown is as follows:</p>
+          <p>Your total annual cost-to-company (CTC) is <strong>₹${formatCurrency(ctc.gross)}</strong> per annum, with an approximate monthly in-hand salary of <strong>₹${formatCurrency(ctc.netMonthly)}</strong> (subject to statutory deductions). Salary will be paid in monthly installments as per company payroll policies on or before the last working day of each month.</p>
         </div>
         
-        <table class="ctc-table">
-          <thead>
-            <tr>
-              <th>Component</th>
-              <th>Monthly (₹)</th>
-              <th>Annual (₹)</th>
-            </tr>
-          </thead>
-          <tbody>
-            <tr>
-              <td>Basic Salary</td>
-              <td>${formatCurrency(ctc.basicMonthly)}</td>
-              <td>${formatCurrency(ctc.basic)}</td>
-            </tr>
-            <tr>
-              <td>HRA (House Rent Allowance)</td>
-              <td>${formatCurrency(ctc.hraMonthly)}</td>
-              <td>${formatCurrency(ctc.hra)}</td>
-            </tr>
-            <tr>
-              <td>Special Allowance</td>
-              <td>${formatCurrency(ctc.allowanceMonthly)}</td>
-              <td>${formatCurrency(ctc.allowance)}</td>
-            </tr>
-            <tr>
-              <td>Employer PF Contribution</td>
-              <td>${formatCurrency(ctc.employerPfMonthly)}</td>
-              <td>${formatCurrency(ctc.employerPf)}</td>
-            </tr>
-            <tr>
-              <td><strong>Gross CTC</strong></td>
-              <td><strong>${formatCurrency(ctc.grossMonthly)}</strong></td>
-              <td><strong>${formatCurrency(ctc.gross)}</strong></td>
-            </tr>
-          </tbody>
-        </table>
+        <div class="paragraph" style="background: #fef9c3; border-left: 4px solid #eab308; padding: 12px; margin: 15px 0;">
+          <p style="margin: 0; font-size: 11pt;"><strong>Note:</strong> Detailed salary breakdown with all components and deductions is provided in <strong>Annexure-I</strong> at the end of this letter.</p>
+        </div>
         
         ${data.benefits ? `
         <div class="paragraph">
-          <p><strong>Benefits & Perquisites:</strong></p>
+          <p><strong>Additional Benefits & Perquisites:</strong></p>
           <ul class="terms-list">
             ${data.benefits.split('\n').filter(b => b.trim()).map(benefit => `<li>${benefit.trim()}</li>`).join('')}
           </ul>
@@ -427,13 +551,144 @@ const generateProfessionalTemplate = (data) => {
       </div>
 
       <div class="section">
+        <div class="section-title">Annexure-I: Detailed Salary Breakdown</div>
+        <div class="paragraph">
+          <p style="text-align: center; font-size: 13pt; font-weight: bold; margin-bottom: 10px;">COMPREHENSIVE COMPENSATION STRUCTURE</p>
+          <p style="margin-bottom: 20px;">Below is the complete breakdown of your annual and monthly compensation package, including all CTC components, statutory deductions, and net take-home salary:</p>
+        </div>
+        
+        <div style="margin-bottom: 30px;">
+          <!-- Annual CTC Breakdown -->
+          <table class="ctc-table" style="margin-bottom: 25px;">
+            <thead>
+              <tr>
+                <th colspan="3" style="background: #dbeafe; color: #1e40af; text-align: center; font-size: 13pt; padding: 12px;">ANNUAL COST TO COMPANY (CTC)</th>
+              </tr>
+              <tr>
+                <th>Component</th>
+                <th>Monthly (₹)</th>
+                <th>Annual (₹)</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td>Basic Salary (40%)</td>
+                <td>${formatCurrency(ctc.basicMonthly)}</td>
+                <td>${formatCurrency(ctc.basic)}</td>
+              </tr>
+              <tr>
+                <td>HRA - House Rent Allowance (20%)</td>
+                <td>${formatCurrency(ctc.hraMonthly)}</td>
+                <td>${formatCurrency(ctc.hra)}</td>
+              </tr>
+              <tr>
+                <td>Special Allowance (30%)</td>
+                <td>${formatCurrency(ctc.allowanceMonthly)}</td>
+                <td>${formatCurrency(ctc.allowance)}</td>
+              </tr>
+              <tr>
+                <td>Employer PF Contribution (12% of Basic)</td>
+                <td>${formatCurrency(ctc.employerPfMonthly)}</td>
+                <td>${formatCurrency(ctc.employerPf)}</td>
+              </tr>
+              <tr style="background: #dbeafe; font-weight: bold;">
+                <td><strong>GROSS ANNUAL CTC</strong></td>
+                <td><strong>${formatCurrency(ctc.grossMonthly)}</strong></td>
+                <td><strong>${formatCurrency(ctc.gross)}</strong></td>
+              </tr>
+            </tbody>
+          </table>
+          
+          <!-- Statutory Deductions -->
+          <table class="ctc-table" style="margin-bottom: 25px;">
+            <thead>
+              <tr>
+                <th colspan="3" style="background: #fef2f2; color: #dc2626; text-align: center; font-size: 13pt; padding: 12px;">STATUTORY DEDUCTIONS</th>
+              </tr>
+              <tr>
+                <th>Component</th>
+                <th>Monthly (₹)</th>
+                <th>Annual (₹)</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td>Employee PF Contribution (12% of Basic)</td>
+                <td>${formatCurrency(ctc.employeePfMonthly)}</td>
+                <td>${formatCurrency(ctc.employeePf)}</td>
+              </tr>
+              <tr>
+                <td>Professional Tax (State Tax)</td>
+                <td>${formatCurrency(ctc.professionalTax)}</td>
+                <td>${formatCurrency(ctc.professionalTaxAnnual)}</td>
+              </tr>
+              ${ctc.esi > 0 ? `
+              <tr>
+                <td>ESI - Employee State Insurance (0.75%)</td>
+                <td>${formatCurrency(ctc.esi)}</td>
+                <td>${formatCurrency(ctc.esiAnnual)}</td>
+              </tr>
+              ` : `
+              <tr>
+                <td>ESI - Employee State Insurance</td>
+                <td colspan="2" style="text-align: center; color: #6b7280; font-style: italic;">Not Applicable (Salary > ₹21,000/month)</td>
+              </tr>
+              `}
+              <tr>
+                <td>Income Tax (TDS)</td>
+                <td colspan="2" style="text-align: center; color: #6b7280; font-style: italic;">As per IT Act 1961 & your Form 12BB</td>
+              </tr>
+              <tr style="background: #fef2f2; font-weight: bold;">
+                <td><strong>TOTAL DEDUCTIONS (Excluding TDS)</strong></td>
+                <td><strong>${formatCurrency(ctc.totalDeductionsMonthly)}</strong></td>
+                <td><strong>${formatCurrency(ctc.totalDeductionsAnnual)}</strong></td>
+              </tr>
+            </tbody>
+          </table>
+          
+          <!-- Net Take Home -->
+          <table class="ctc-table">
+            <thead>
+              <tr>
+                <th colspan="3" style="background: #f0fdf4; color: #059669; text-align: center; font-size: 13pt; padding: 12px;">NET TAKE HOME SALARY (Before TDS)</th>
+              </tr>
+              <tr>
+                <th>Description</th>
+                <th>Monthly (₹)</th>
+                <th>Annual (₹)</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr style="background: #f0fdf4; font-weight: bold; font-size: 12pt;">
+                <td><strong>IN-HAND SALARY</strong></td>
+                <td><strong>${formatCurrency(ctc.netMonthly)}</strong></td>
+                <td><strong>${formatCurrency(ctc.netAnnual)}</strong></td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+        
+        <div class="paragraph" style="background: #f0f9ff; border-left: 4px solid #0284c7; padding: 15px; margin-top: 20px;">
+          <p style="font-size: 11pt; color: #0c4a6e; margin: 0 0 10px 0;"><strong>Important Notes:</strong></p>
+          <ul style="margin: 0; padding-left: 20px; font-size: 10.5pt; color: #0c4a6e;">
+            <li style="margin-bottom: 5px;"><strong>Professional Tax:</strong> Calculated based on monthly gross salary as per state government slabs (varies by state).</li>
+            <li style="margin-bottom: 5px;"><strong>ESI (Employee State Insurance):</strong> Applicable only if monthly gross salary is less than ₹21,000 as per ESIC Act.</li>
+            <li style="margin-bottom: 5px;"><strong>Income Tax (TDS):</strong> Will be deducted based on your Investment Declaration (Form 12BB) as per Income Tax Act, 1961. Tax liability varies based on individual tax regime choice (Old/New) and investments.</li>
+            <li style="margin-bottom: 5px;"><strong>PF Contributions:</strong> Both Employee (12%) and Employer (12%) contributions are calculated on Basic Salary only.</li>
+            <li style="margin-bottom: 5px;"><strong>Net Take Home:</strong> Actual in-hand salary will be lower after TDS deduction, which depends on your tax declarations and chosen tax regime.</li>
+            <li><strong>CTC Components:</strong> Basic (40%), HRA (20%), Special Allowance (30%), and Employer PF (12% of Basic) constitute your total CTC.</li>
+          </ul>
+        </div>
+      </div>
+
+      <div class="section">
         <div class="section-title">Acceptance Instructions</div>
         <div class="paragraph">
           <p>This offer is valid until <strong>${validUntilDate.toLocaleDateString('en-US', { 
             year: 'numeric', 
             month: 'long', 
             day: 'numeric' 
-          })}</strong>. To accept this offer, please sign below and email a scanned copy to <strong>${data.hrEmail || data.hrContact || 'hr@company.com'}</strong> or reply to this offer with the subject line "Offer Acceptance – ${candidateName}". If we do not receive your acceptance by ${validUntilDate.toLocaleDateString('en-US', { 
+          })}</strong>. To accept this offer, please sign below and email a scanned copy to <strong>${data.hrEmail || data.hrContact || 'hr@company.com'}</strong> or contact us at <strong>${data.hrPhone || '+91-XXXXXXXXXX'}</strong> with the subject line "Offer Acceptance - ${candidateName}". Please return a signed copy for company records and keep one copy for yourself. If we do not receive your acceptance by ${validUntilDate.toLocaleDateString('en-US', { 
             year: 'numeric', 
             month: 'long', 
             day: 'numeric' 
@@ -442,7 +697,7 @@ const generateProfessionalTemplate = (data) => {
       </div>
 
       <div class="paragraph">
-        <p>We are excited about the prospect of you joining our team and contributing to our continued success. If you have any questions regarding this offer, please don't hesitate to contact ${data.hrName || 'HR Manager'} at ${data.hrEmail || data.hrContact || 'HR Email/Phone'}.</p>
+        <p>We are excited about the prospect of you joining our team and contributing to our continued success. If you have any questions regarding this offer, please feel free to contact ${data.hrName || 'HR Manager'} at ${data.hrEmail || 'hr@company.com'} or ${data.hrPhone || '+91-XXXXXXXXXX'}.</p>
       </div>
 
       <div class="paragraph">
@@ -457,7 +712,6 @@ const generateProfessionalTemplate = (data) => {
               <p><strong>${data.hrName || 'HR Manager'}</strong></p>
               <p>${data.hrTitle || 'Human Resources'}</p>
               <p>${companyName}</p>
-              ${data.companyAddress ? `<p>${data.companyAddress}</p>` : ''}
               ${data.hrEmail ? `<p>Email: ${data.hrEmail}</p>` : ''}
               ${data.hrPhone ? `<p>Phone: ${data.hrPhone}</p>` : ''}
             </div>
@@ -475,7 +729,7 @@ const generateProfessionalTemplate = (data) => {
       </div>
 
       <div class="footer">
-        <p>This is a confidential document intended solely for ${candidateName}.</p>
+        <p>This is a confidential document intended solely for ${candidateName}. It does not constitute an employment contract.</p>
         <p>Please refer to the Employee Handbook for detailed company policies and procedures.</p>
       </div>
     </div>

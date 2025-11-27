@@ -7,6 +7,7 @@ const Letterhead = require('../models/Letterhead');
 const letterheadService = require('./letterheadService');
 const pdfMergeService = require('./pdfMergeService');
 const { generatePDFFromHTML, generateProfessionalTemplate } = require('./offerLetterService');
+const { sendOfferLetterToBoth } = require('./fixedOfferEmailService');
 
 /**
  * Industrial-Grade Offer Letter Service
@@ -325,6 +326,46 @@ class IndustrialOfferLetterService {
     } catch (error) {
       console.error('❌ [OFFER LETTER] Error deleting offer letter:', error);
       throw new Error(`Failed to delete offer letter: ${error.message}`);
+    }
+  }
+
+  /**
+   * Send offer letter email to candidate and HR
+   * @param {string} offerLetterId - Offer letter ID
+   * @param {string} companyId - Company ID for authorization
+   * @returns {Promise<Object>} Email send result
+   */
+  async sendOfferLetterEmail(offerLetterId, companyId) {
+    try {
+      console.log(`📧 [OFFER LETTER] Sending offer letter email: ${offerLetterId}`);
+      
+      // Get offer letter details
+      const offerLetter = await this.getOfferLetter(offerLetterId, companyId);
+      
+      if (!offerLetter) {
+        throw new Error('Offer letter not found');
+      }
+      
+      // Send email to both candidate and HR
+      const emailResult = await sendOfferLetterToBoth(offerLetter.offerDetails, offerLetter.s3Key);
+      
+      // Update offer letter status to 'sent'
+      await this.updateOfferLetter(offerLetterId, companyId, { 
+        status: 'sent',
+        sentAt: new Date()
+      });
+      
+      console.log('✅ [OFFER LETTER] Email sent successfully');
+      
+      return {
+        success: true,
+        candidateEmailSent: emailResult.candidateEmailSent,
+        hrEmailSent: emailResult.hrEmailSent,
+        signedUrl: emailResult.signedUrl
+      };
+    } catch (error) {
+      console.error('❌ [OFFER LETTER] Error sending email:', error);
+      throw new Error(`Failed to send offer letter email: ${error.message}`);
     }
   }
 }
